@@ -1,0 +1,22 @@
+{
+  "short_name": "CBT MAS Al-Ma'sum",
+  "name": "CBT MAS Al-Ma'sum Malausma",
+  "description": "Aplikasi CBT Madrasah High Fidelity dengan Fitur Android Simulator",
+  "icons": [
+    {
+      "src": "https://img.icons8.com/color/192/000000/school.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "https://img.icons8.com/color/512/000000/school.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": "/",
+  "background_color": "#ffffff",
+  "theme_color": "#0666AE",
+  "display": "standalone",
+  "orientation": "portrait"
+}

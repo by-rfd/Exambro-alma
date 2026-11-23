@@ -1,0 +1,6 @@
+{
+  "name": "Exambro MA Al-Ma'sum",
+  "description": "Sistem Ujian Digital CBT Terintegrasi - Portal Web Admin/Guru & Simulator Aplikasi Siswa Android (Anti-Cheat)",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
