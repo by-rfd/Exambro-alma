@@ -159,3 +159,30 @@ export function formatSoalKelasNames(
   });
   return Array.from(new Set(names));
 }
+
+function extractSoalUploadKey(soal: Pick<Soal, "id" | "createdAt" | "urutan">): [number, number] {
+  if (typeof soal.createdAt === "number" && Number.isFinite(soal.createdAt)) {
+    return [soal.createdAt, typeof soal.urutan === "number" && Number.isFinite(soal.urutan) ? soal.urutan : 0];
+  }
+  const id = String(soal.id || "");
+  let m = id.match(/^soal_(?:guru|mass|admin|xl|import)_?(\d+)_(\d+)(?:_|$)/i);
+  if (m) return [Number(m[1]), Number(m[2])];
+  m = id.match(/^soal_(?:guru|mass|admin|manual|import)?_?(\d+)(?:_|$)/i);
+  if (m) return [Number(m[1]), 0];
+  m = id.match(/^q(\d+)_(\d+)$/i);
+  if (m) return [Number(m[1]), Number(m[2])];
+  return [Number.MAX_SAFE_INTEGER, 0];
+}
+
+export function compareSoalUploadOrder(a: Soal, b: Soal): number {
+  const [tsA, idxA] = extractSoalUploadKey(a);
+  const [tsB, idxB] = extractSoalUploadKey(b);
+  if (tsA !== tsB) return tsA - tsB;
+  if (idxA !== idxB) return idxA - idxB;
+  return String(a.id || "").localeCompare(String(b.id || ""), undefined, { numeric: true });
+}
+
+export function sortSoalByUploadOrder<T extends Soal>(list: T[]): T[] {
+  if (!Array.isArray(list) || list.length <= 1) return Array.isArray(list) ? [...list] : [];
+  return [...list].sort(compareSoalUploadOrder);
+}

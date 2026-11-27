@@ -91,6 +91,143 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
 }
 
 // ----------------------------------------------------------------------------
+// HELPER: Safe Blob PDF download (reliable in iframes & mobile browsers)
+// ----------------------------------------------------------------------------
+function triggerPdfBlobDownload(pdf: jsPDF, fileName: string) {
+  const blob = pdf.output("blob");
+  const blobUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = blobUrl;
+  link.download = fileName;
+  link.rel = "noopener";
+  link.style.display = "none";
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+}
+
+// ----------------------------------------------------------------------------
+// HELPER: Convert any image URL (WebP, PNG, local path, CORS URL) -> PNG Data URL
+// ----------------------------------------------------------------------------
+async function loadImageAsPngDataUrl(
+  src?: string,
+  fallbackSrc = "/school-logo.png"
+): Promise<string | null> {
+  const tryLoad = (url: string): Promise<string | null> =>
+    new Promise((resolve) => {
+      if (!url) {
+        resolve(null);
+        return;
+      }
+      const img = new Image();
+      const isRemote = /^https?:\/\//i.test(url) && !url.startsWith(window.location.origin);
+      if (isRemote) {
+        img.crossOrigin = "anonymous";
+      }
+      const timer = setTimeout(() => resolve(null), 5000);
+      img.onload = () => {
+        clearTimeout(timer);
+        try {
+          const w = img.naturalWidth || img.width;
+          const h = img.naturalHeight || img.height;
+          if (!w || !h) {
+            resolve(null);
+            return;
+          }
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.min(w, 600);
+          canvas.height = Math.round((h * canvas.width) / w);
+          const ctx = canvas.getContext("2d");
+          if (!ctx) {
+            resolve(null);
+            return;
+          }
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          resolve(canvas.toDataURL("image/png"));
+        } catch {
+          resolve(null);
+        }
+      };
+      img.onerror = () => {
+        clearTimeout(timer);
+        resolve(null);
+      };
+      img.src = url;
+    });
+
+  if (src) {
+    const loaded = await tryLoad(src);
+    if (loaded) return loaded;
+  }
+  if (fallbackSrc && fallbackSrc !== src) {
+    return tryLoad(fallbackSrc);
+  }
+  return null;
+}
+
+// ----------------------------------------------------------------------------
+// HELPER: Normalize Tailwind v4 oklch/oklab/color-mix CSS for html2canvas
+// ----------------------------------------------------------------------------
+function createCssColorNormalizer() {
+  const canvas = document.createElement("canvas");
+  canvas.width = 1;
+  canvas.height = 1;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const cache = new Map<string, string>();
+
+  const toRgb = (cssColor: string): string => {
+    if (!cssColor || cssColor === "transparent" || cssColor === "none") return cssColor;
+    if (!/(oklch|oklab|color-mix|color\(|lab\(|lch\()/i.test(cssColor)) return cssColor;
+    const cached = cache.get(cssColor);
+    if (cached) return cached;
+    if (!ctx) return "#000000";
+    try {
+      ctx.clearRect(0, 0, 1, 1);
+      ctx.fillStyle = "rgba(0,0,0,0)";
+      ctx.fillStyle = cssColor;
+      ctx.fillRect(0, 0, 1, 1);
+      const [r, g, b, a] = ctx.getImageData(0, 0, 1, 1).data;
+      const out = a >= 255 ? `rgb(${r}, ${g}, ${b})` : `rgba(${r}, ${g}, ${b}, ${(a / 255).toFixed(3)})`;
+      cache.set(cssColor, out);
+      return out;
+    } catch {
+      return "rgb(0, 0, 0)";
+    }
+  };
+
+  return (clonedDoc: Document, rootEl: HTMLElement) => {
+    const win = clonedDoc.defaultView || window;
+    const allEls = [rootEl, ...Array.from(rootEl.querySelectorAll<HTMLElement>("*"))];
+    for (const el of allEls) {
+      try {
+        const cs = win.getComputedStyle(el);
+        const color = cs.color;
+        const bg = cs.backgroundColor;
+        const borderTop = cs.borderTopColor;
+        const borderRight = cs.borderRightColor;
+        const borderBottom = cs.borderBottomColor;
+        const borderLeft = cs.borderLeftColor;
+        const outline = cs.outlineColor;
+
+        if (color && /(oklch|oklab|color-mix|color\()/i.test(color)) el.style.color = toRgb(color);
+        if (bg && /(oklch|oklab|color-mix|color\()/i.test(bg)) el.style.backgroundColor = toRgb(bg);
+        if (borderTop && /(oklch|oklab|color-mix|color\()/i.test(borderTop)) el.style.borderTopColor = toRgb(borderTop);
+        if (borderRight && /(oklch|oklab|color-mix|color\()/i.test(borderRight)) el.style.borderRightColor = toRgb(borderRight);
+        if (borderBottom && /(oklch|oklab|color-mix|color\()/i.test(borderBottom)) el.style.borderBottomColor = toRgb(borderBottom);
+        if (borderLeft && /(oklch|oklab|color-mix|color\()/i.test(borderLeft)) el.style.borderLeftColor = toRgb(borderLeft);
+        if (outline && /(oklch|oklab|color-mix|color\()/i.test(outline)) el.style.outlineColor = toRgb(outline);
+        if (cs.boxShadow && /(oklch|oklab|color-mix|color\()/i.test(cs.boxShadow)) {
+          el.style.boxShadow = "none";
+        }
+      } catch {
+        // ignore uncomputable pseudo nodes
+      }
+    }
+  };
+}
+
+// ----------------------------------------------------------------------------
 // PRINT CARDS COMPONENT (A4 - 8 KARTU ATAU 10 KARTU PER HALAMAN)
 // ----------------------------------------------------------------------------
 interface PrintCardsProps {
@@ -123,9 +260,10 @@ export function PrintCards({
     return new Set(siswaList.map((s) => s.id));
   });
 
-  // PDF Generation progress
+  // PDF Generation progress & inline status banner
   const [isExportingPdf, setIsExportingPdf] = useState<boolean>(false);
   const [exportProgress, setExportProgress] = useState<string>("");
+  const [actionMessage, setActionMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
   // Get all unique class names across data
   const availableClasses = useMemo(() => {
@@ -169,10 +307,10 @@ export function PrintCards({
     });
   }, [siswaList, selectedKelas, searchQuery, kelasList]);
 
-  // Actual selected students to render/print (subset of filtered or total selected)
+  // Actual selected students matching active class/search filter
   const printableSiswa = useMemo(() => {
-    return siswaList.filter((s) => selectedIds.has(s.id));
-  }, [siswaList, selectedIds]);
+    return filteredSiswa.filter((s) => selectedIds.has(s.id));
+  }, [filteredSiswa, selectedIds]);
 
   // Chunks of students per A4 page
   const pages = useMemo(() => {
@@ -212,22 +350,23 @@ export function PrintCards({
     setSelectedIds(new Set());
   };
 
-  // Direct A4 PDF Generation using jsPDF & html2canvas
+  // Direct Vector A4 PDF Generation using jsPDF + QRCode (crisp, fast for 350+ students, immune to Tailwind oklch & CORS)
   const handleDownloadPDF = async () => {
+    setActionMessage(null);
     if (printableSiswa.length === 0) {
-      alert("Pilih minimal 1 siswa untuk membuat PDF Kartu Ujian.");
+      setActionMessage({ type: "error", text: "Pilih minimal 1 siswa untuk mengunduh PDF Kartu Ujian." });
       return;
     }
 
-    if (!printAreaRef.current) return;
-    const pageNodes = printAreaRef.current.querySelectorAll<HTMLElement>(".a4-sheet-container");
-    if (!pageNodes || pageNodes.length === 0) return;
-
     try {
       setIsExportingPdf(true);
-      const totalPages = pageNodes.length;
+      setExportProgress("Menyiapkan logo & layout A4...");
 
-      // Create PDF in A4 portrait (210 x 297 mm)
+      const [logoKiriPng, logoKananPng] = await Promise.all([
+        loadImageAsPngDataUrl(konfig.logoKiriUrl, "/school-logo.png"),
+        loadImageAsPngDataUrl(konfig.logoKananUrl, "/school-logo.png"),
+      ]);
+
       const pdf = new jsPDF({
         orientation: "portrait",
         unit: "mm",
@@ -235,32 +374,246 @@ export function PrintCards({
         compress: true,
       });
 
-      for (let i = 0; i < totalPages; i++) {
-        setExportProgress(`Memproses Lembar ${i + 1} dari ${totalPages}...`);
-        const pageEl = pageNodes[i];
+      const marginX = 6;
+      const marginY = 7;
+      const gapX = cardsPerPage === 8 ? 4 : 3;
+      const gapY = cardsPerPage === 8 ? 3.5 : 2.2;
+      const cols = 2;
+      const rows = cardsPerPage === 8 ? 4 : 5;
+      const cardW = (210 - marginX * 2 - gapX) / cols;
+      const cardH = (297 - marginY * 2 - gapY * (rows - 1)) / rows;
 
-        const canvas = await html2canvas(pageEl, {
-          scale: 2, // 2x scale for sharp text and QR codes
-          useCORS: true,
-          logging: false,
-          backgroundColor: "#ffffff",
-          windowWidth: 1024,
-        });
+      const totalPages = pages.length;
+      const schoolTitle = (konfig.namaSekolah || "MA AL-MA'SUM MALAUSMA").toUpperCase();
 
-        const imgData = canvas.toDataURL("image/jpeg", 0.95);
-        if (i > 0) {
+      const truncateToWidth = (text: string, maxW: number): string => {
+        if (!text) return "";
+        if (pdf.getTextWidth(text) <= maxW) return text;
+        let trimmed = text;
+        while (trimmed.length > 1 && pdf.getTextWidth(trimmed + "...") > maxW) {
+          trimmed = trimmed.slice(0, -1);
+        }
+        return trimmed + "...";
+      };
+
+      for (let pIdx = 0; pIdx < totalPages; pIdx++) {
+        setExportProgress(`Membuat Lembar ${pIdx + 1} dari ${totalPages}...`);
+        if (pIdx > 0) {
           pdf.addPage("a4", "portrait");
         }
-        pdf.addImage(imgData, "JPEG", 0, 0, 210, 297, undefined, "FAST");
+        const pageSiswa = pages[pIdx];
+
+        for (let cIdx = 0; cIdx < pageSiswa.length; cIdx++) {
+          const siswa = pageSiswa[cIdx];
+          const col = cIdx % cols;
+          const row = Math.floor(cIdx / cols);
+          const x = marginX + col * (cardW + gapX);
+          const y = marginY + row * (cardH + gapY);
+
+          // Card background & dashed cut border
+          pdf.setFillColor(255, 255, 255);
+          pdf.setDrawColor(148, 163, 184);
+          pdf.setLineWidth(0.3);
+          pdf.setLineDashPattern([1.2, 1.2], 0);
+          pdf.roundedRect(x, y, cardW, cardH, 2.2, 2.2, "FD");
+          pdf.setLineDashPattern([], 0);
+
+          const pad = cardsPerPage === 8 ? 3 : 2.3;
+          const headerH = cardsPerPage === 8 ? 10 : 8;
+          const logoSize = cardsPerPage === 8 ? 7.5 : 5.8;
+
+          // Header logos
+          if (logoKiriPng) {
+            try {
+              pdf.addImage(logoKiriPng, "PNG", x + pad, y + 1.8, logoSize, logoSize);
+            } catch {
+              // ignore invalid image
+            }
+          }
+          if (logoKananPng) {
+            try {
+              pdf.addImage(logoKananPng, "PNG", x + cardW - pad - logoSize, y + 1.8, logoSize, logoSize);
+            } catch {
+              // ignore invalid image
+            }
+          }
+
+          // Header titles
+          const titleMaxW = cardW - pad * 2 - logoSize * 2 - 4;
+          pdf.setFont("helvetica", "bold");
+          pdf.setFontSize(cardsPerPage === 8 ? 8.2 : 7.2);
+          pdf.setTextColor(15, 23, 42);
+          pdf.text(truncateToWidth(schoolTitle, titleMaxW), x + cardW / 2, y + (cardsPerPage === 8 ? 4.8 : 4.2), {
+            align: "center",
+          });
+
+          pdf.setFontSize(cardsPerPage === 8 ? 6.8 : 6.0);
+          pdf.setTextColor(6, 102, 174);
+          pdf.text(
+            cardsPerPage === 8 ? "KARTU PESERTA ASESMEN / UJIAN CBT" : "KARTU PESERTA UJIAN CBT",
+            x + cardW / 2,
+            y + (cardsPerPage === 8 ? 8.2 : 7.0),
+            { align: "center" }
+          );
+
+          // Header bottom divider
+          const headerBottomY = y + headerH + 0.6;
+          pdf.setDrawColor(203, 213, 225);
+          pdf.setLineWidth(0.25);
+          pdf.line(x + pad, headerBottomY, x + cardW - pad, headerBottomY);
+
+          // QR Code block on the left
+          const credentials = JSON.stringify({
+            u: siswa.username,
+            p: siswa.password || "Password123",
+          });
+          const qrDataUrl = await QRCode.toDataURL(credentials, {
+            width: 300,
+            margin: 1,
+            errorCorrectionLevel: "M",
+            color: { dark: "#0f172a", light: "#ffffff" },
+          });
+
+          const qrBoxW = cardsPerPage === 8 ? 22.5 : 17.5;
+          const qrImgSize = cardsPerPage === 8 ? 19.5 : 15;
+          const qrBoxH = qrImgSize + 5;
+          const footerLineY = y + cardH - (cardsPerPage === 8 ? 5.2 : 4.2);
+          const bodyTopY = headerBottomY + 1.5;
+          const bodyMidY = bodyTopY + (footerLineY - bodyTopY - qrBoxH) / 2;
+
+          pdf.setFillColor(248, 250, 252);
+          pdf.setDrawColor(226, 232, 240);
+          pdf.roundedRect(x + pad, bodyMidY, qrBoxW, qrBoxH, 1.5, 1.5, "FD");
+          pdf.addImage(qrDataUrl, "PNG", x + pad + (qrBoxW - qrImgSize) / 2, bodyMidY + 1, qrImgSize, qrImgSize);
+
+          pdf.setFont("helvetica", "bold");
+          pdf.setFontSize(cardsPerPage === 8 ? 5.8 : 5.0);
+          pdf.setTextColor(6, 102, 174);
+          pdf.text(
+            cardsPerPage === 8 ? "SCAN LOGIN" : "SCAN",
+            x + pad + qrBoxW / 2,
+            bodyMidY + qrImgSize + 3.6,
+            { align: "center" }
+          );
+
+          // Student details on the right
+          const infoX = x + pad + qrBoxW + 2.8;
+          const infoW = x + cardW - pad - infoX;
+          let curY = bodyTopY + (cardsPerPage === 8 ? 2.5 : 2.0);
+          const kelasDisplay = siswa.kelas || getKelasNama(siswa.kelasId);
+
+          pdf.setFont("helvetica", "bold");
+          pdf.setFontSize(cardsPerPage === 8 ? 5.8 : 5.2);
+          pdf.setTextColor(100, 116, 139);
+          pdf.text("NAMA LENGKAP", infoX, curY);
+          curY += cardsPerPage === 8 ? 3.8 : 3.1;
+
+          pdf.setFont("helvetica", "bold");
+          pdf.setFontSize(cardsPerPage === 8 ? 9.2 : 8.0);
+          pdf.setTextColor(15, 23, 42);
+          pdf.text(truncateToWidth(siswa.nama || "-", infoW), infoX, curY);
+          curY += cardsPerPage === 8 ? 4.4 : 3.6;
+
+          // NISN & Kelas row
+          const halfW = infoW / 2 - 1;
+          pdf.setFont("helvetica", "bold");
+          pdf.setFontSize(cardsPerPage === 8 ? 5.5 : 5.0);
+          pdf.setTextColor(100, 116, 139);
+          pdf.text("NISN", infoX, curY);
+          pdf.text("KELAS", infoX + halfW + 2, curY);
+          curY += cardsPerPage === 8 ? 3.2 : 2.8;
+
+          pdf.setFont("helvetica", "bold");
+          pdf.setFontSize(cardsPerPage === 8 ? 7.8 : 6.9);
+          pdf.setTextColor(30, 41, 59);
+          pdf.text(truncateToWidth(siswa.nisn || "-", halfW), infoX, curY);
+          pdf.setTextColor(6, 102, 174);
+          pdf.text(truncateToWidth(kelasDisplay, halfW), infoX + halfW + 2, curY);
+          curY += cardsPerPage === 8 ? 3.9 : 3.2;
+
+          if (siswa.noPeserta) {
+            pdf.setFont("helvetica", "bold");
+            pdf.setFontSize(cardsPerPage === 8 ? 5.5 : 4.9);
+            pdf.setTextColor(100, 116, 139);
+            pdf.text("NO. PESERTA", infoX, curY);
+            curY += cardsPerPage === 8 ? 3.0 : 2.6;
+
+            pdf.setFont("helvetica", "bold");
+            pdf.setFontSize(cardsPerPage === 8 ? 7.4 : 6.6);
+            pdf.setTextColor(51, 65, 85);
+            pdf.text(truncateToWidth(siswa.noPeserta, infoW), infoX, curY);
+            curY += cardsPerPage === 8 ? 3.6 : 2.8;
+          }
+
+          // Credentials boxes (USER & PASS)
+          const credH = cardsPerPage === 8 ? 8.0 : 6.8;
+          const credY = Math.min(curY + 0.5, footerLineY - credH - 1.5);
+          const credBoxW = (infoW - 2) / 2;
+
+          // USER box
+          pdf.setFillColor(239, 246, 255);
+          pdf.setDrawColor(191, 219, 254);
+          pdf.roundedRect(infoX, credY, credBoxW, credH, 1.2, 1.2, "FD");
+          pdf.setFont("helvetica", "bold");
+          pdf.setFontSize(cardsPerPage === 8 ? 5.3 : 4.8);
+          pdf.setTextColor(3, 105, 161);
+          pdf.text("USER", infoX + 1.4, credY + (cardsPerPage === 8 ? 2.6 : 2.2));
+          pdf.setFontSize(cardsPerPage === 8 ? 7.6 : 6.8);
+          pdf.setTextColor(6, 102, 174);
+          pdf.text(
+            truncateToWidth(siswa.username || "-", credBoxW - 2.6),
+            infoX + 1.4,
+            credY + (cardsPerPage === 8 ? 6.2 : 5.2)
+          );
+
+          // PASS box
+          const passX = infoX + credBoxW + 2;
+          pdf.setFillColor(241, 245, 249);
+          pdf.setDrawColor(203, 213, 225);
+          pdf.roundedRect(passX, credY, credBoxW, credH, 1.2, 1.2, "FD");
+          pdf.setFont("helvetica", "bold");
+          pdf.setFontSize(cardsPerPage === 8 ? 5.3 : 4.8);
+          pdf.setTextColor(100, 116, 139);
+          pdf.text("PASS", passX + 1.4, credY + (cardsPerPage === 8 ? 2.6 : 2.2));
+          pdf.setFontSize(cardsPerPage === 8 ? 7.6 : 6.8);
+          pdf.setTextColor(30, 41, 59);
+          pdf.text(
+            truncateToWidth(siswa.password || "Password123", credBoxW - 2.6),
+            passX + 1.4,
+            credY + (cardsPerPage === 8 ? 6.2 : 5.2)
+          );
+
+          // Card footer divider & text
+          pdf.setDrawColor(226, 232, 240);
+          pdf.setLineWidth(0.2);
+          pdf.line(x + pad, footerLineY, x + cardW - pad, footerLineY);
+          pdf.setFont("helvetica", "italic");
+          pdf.setFontSize(cardsPerPage === 8 ? 5.6 : 5.0);
+          pdf.setTextColor(148, 163, 184);
+          pdf.text(
+            cardsPerPage === 8
+              ? "Simpan kartu ujian ini baik-baik selama pelaksanaan ujian berlangsung."
+              : "Harap menjaga kartu ini hingga seluruh sesi ujian selesai.",
+            x + cardW / 2,
+            y + cardH - (cardsPerPage === 8 ? 1.8 : 1.5),
+            { align: "center" }
+          );
+        }
       }
 
       const kelasLabel = selectedKelas === "all" ? "Semua_Kelas" : selectedKelas.replace(/\s+/g, "_");
       const fileName = `Kartu_Ujian_A4_${cardsPerPage}Kartu_${kelasLabel}_${new Date().toISOString().split("T")[0]}.pdf`;
-      pdf.save(fileName);
-      setExportProgress("Selesai!");
-    } catch (err) {
+      triggerPdfBlobDownload(pdf, fileName);
+      setActionMessage({
+        type: "success",
+        text: `PDF "${fileName}" berhasil dibuat (${printableSiswa.length} kartu, ${totalPages} halaman A4).`,
+      });
+    } catch (err: any) {
       console.error("Gagal export PDF:", err);
-      alert("Terjadi kendala saat membuat file PDF. Silakan coba gunakan tombol Cetak Browser (Simpan sebagai PDF).");
+      setActionMessage({
+        type: "error",
+        text: `Gagal membuat PDF (${err?.message || "kesalahan internal"}). Coba gunakan tombol Cetak / Simpan PDF.`,
+      });
     } finally {
       setIsExportingPdf(false);
       setExportProgress("");
@@ -269,14 +622,21 @@ export function PrintCards({
 
   // Native Browser Print (A4 with exact CSS rules)
   const handleBrowserPrint = () => {
+    setActionMessage(null);
     if (printableSiswa.length === 0) {
-      alert("Pilih minimal 1 siswa untuk mencetak kartu ujian.");
+      setActionMessage({ type: "error", text: "Pilih minimal 1 siswa untuk mencetak kartu ujian." });
       return;
     }
-    // Switch to preview tab so print nodes are active in DOM
     setActiveTab("preview");
     setTimeout(() => {
-      window.print();
+      try {
+        window.print();
+      } catch {
+        setActionMessage({
+          type: "error",
+          text: "Dialog cetak browser diblokir oleh tampilan sematan. Gunakan tombol hijau 'Unduh File PDF' untuk menyimpan dokumen.",
+        });
+      }
     }, 150);
   };
 
@@ -289,9 +649,13 @@ export function PrintCards({
             size: A4 portrait;
             margin: 6mm 6mm 6mm 6mm;
           }
-          body {
-            visibility: hidden !important;
+          html, body {
+            height: auto !important;
+            overflow: visible !important;
             background: white !important;
+          }
+          body * {
+            visibility: hidden !important;
           }
           #print-modal-portal, #print-modal-portal * {
             visibility: visible !important;
@@ -301,10 +665,21 @@ export function PrintCards({
             left: 0 !important;
             top: 0 !important;
             width: 100% !important;
+            height: auto !important;
             background: white !important;
             padding: 0 !important;
             margin: 0 !important;
             overflow: visible !important;
+            display: block !important;
+          }
+          .print-modal-card, .print-scroll-body {
+            max-height: none !important;
+            height: auto !important;
+            overflow: visible !important;
+            box-shadow: none !important;
+            border: none !important;
+            background: white !important;
+            padding: 0 !important;
           }
           .no-print {
             display: none !important;
@@ -327,7 +702,7 @@ export function PrintCards({
       `}</style>
 
       {/* Main Container */}
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-6xl max-h-[96vh] flex flex-col overflow-hidden border border-slate-200">
+      <div className="print-modal-card bg-white rounded-2xl shadow-2xl w-full max-w-6xl max-h-[96vh] flex flex-col overflow-hidden border border-slate-200">
         {/* Top Header Bar */}
         <div className="no-print p-4 bg-gradient-to-r from-[#0666AE] to-[#044a80] text-white flex flex-wrap justify-between items-center gap-3 border-b border-sky-800">
           <div className="flex items-center gap-3">
@@ -529,8 +904,28 @@ export function PrintCards({
           </div>
         </div>
 
+        {/* Inline Feedback Banner */}
+        {actionMessage && (
+          <div
+            className={`no-print px-4 py-2 text-xs font-bold flex items-center justify-between border-b ${
+              actionMessage.type === "success"
+                ? "bg-emerald-50 text-emerald-800 border-emerald-200"
+                : "bg-rose-50 text-rose-800 border-rose-200"
+            }`}
+          >
+            <span>{actionMessage.text}</span>
+            <button
+              type="button"
+              onClick={() => setActionMessage(null)}
+              className="ml-3 px-2 py-0.5 rounded hover:bg-black/5 text-[11px] cursor-pointer"
+            >
+              Tutup
+            </button>
+          </div>
+        )}
+
         {/* Modal Body: Switch between Selection View and A4 Preview */}
-        <div className="flex-1 overflow-y-auto bg-slate-200/70 p-3 sm:p-6 text-slate-800">
+        <div className="print-scroll-body flex-1 overflow-y-auto bg-slate-200/70 p-3 sm:p-6 text-slate-800">
           {/* TAB 1: SELECTION CHECKLIST TABLE */}
           {activeTab === "selection" && (
             <div className="no-print max-w-4xl mx-auto bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
@@ -986,6 +1381,7 @@ export function PrintBeritaAcara({
   // PDF Export state
   const [isExportingPdf, setIsExportingPdf] = useState<boolean>(false);
   const [exportProgress, setExportProgress] = useState<string>("");
+  const [actionMessage, setActionMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
   // Unique classes
   const availableClasses = useMemo(() => {
@@ -1056,15 +1452,30 @@ export function PrintBeritaAcara({
     setSelectedIds(next);
   };
 
-  // PDF Download using jsPDF
+  // PDF Download using jsPDF + color/CORS-sanitized html2canvas
   const handleDownloadPDF = async () => {
+    setActionMessage(null);
     if (!printAreaRef.current) return;
-    const pageNodes = printAreaRef.current.querySelectorAll<HTMLElement>(".a4-ba-sheet");
+
+    if (activeTab !== "preview") {
+      setActiveTab("preview");
+      await new Promise((resolve) => setTimeout(resolve, 180));
+    }
+
+    const pageNodes = printAreaRef.current?.querySelectorAll<HTMLElement>(".a4-ba-sheet");
     if (!pageNodes || pageNodes.length === 0) return;
 
     try {
       setIsExportingPdf(true);
       const totalPages = pageNodes.length;
+      const normalizeColors = createCssColorNormalizer();
+
+      const [logoKiriPng, logoKananPng, stempelPng, ttdPng] = await Promise.all([
+        loadImageAsPngDataUrl(konfig.logoKiriUrl, "/school-logo.png"),
+        loadImageAsPngDataUrl(konfig.logoKananUrl, "/school-logo.png"),
+        konfig.stempelSekolahUrl ? loadImageAsPngDataUrl(konfig.stempelSekolahUrl, "") : Promise.resolve(null),
+        konfig.ttdKepsekUrl ? loadImageAsPngDataUrl(konfig.ttdKepsekUrl, "") : Promise.resolve(null),
+      ]);
 
       const pdf = new jsPDF({
         orientation: "portrait",
@@ -1083,6 +1494,26 @@ export function PrintBeritaAcara({
           logging: false,
           backgroundColor: "#ffffff",
           windowWidth: 1024,
+          onclone: (clonedDoc, clonedEl) => {
+            normalizeColors(clonedDoc, clonedEl);
+            const imgs = clonedEl.querySelectorAll("img");
+            imgs.forEach((img) => {
+              const alt = (img.getAttribute("alt") || "").toLowerCase();
+              if (alt.includes("logo kiri")) {
+                if (logoKiriPng) img.src = logoKiriPng;
+                else img.style.display = "none";
+              } else if (alt.includes("logo kanan")) {
+                if (logoKananPng) img.src = logoKananPng;
+                else img.style.display = "none";
+              } else if (alt.includes("stempel")) {
+                if (stempelPng) img.src = stempelPng;
+                else img.style.display = "none";
+              } else if (alt.includes("tanda tangan")) {
+                if (ttdPng) img.src = ttdPng;
+                else img.style.display = "none";
+              }
+            });
+          },
         });
 
         const imgData = canvas.toDataURL("image/jpeg", 0.95);
@@ -1095,11 +1526,17 @@ export function PrintBeritaAcara({
       const mapelName = (selectedMapel?.nama || "Ujian").replace(/[^a-zA-Z0-9]/g, "_");
       const kelasLabel = selectedKelas === "all" ? "Semua_Kelas" : selectedKelas.replace(/[^a-zA-Z0-9]/g, "_");
       const fileName = `Berita_Acara_A4_${mapelName}_${kelasLabel}_${tanggalUjian}.pdf`;
-      pdf.save(fileName);
-      setExportProgress("Selesai!");
-    } catch (err) {
+      triggerPdfBlobDownload(pdf, fileName);
+      setActionMessage({
+        type: "success",
+        text: `PDF "${fileName}" berhasil diunduh (${totalPages} halaman A4).`,
+      });
+    } catch (err: any) {
       console.error("Gagal export PDF Berita Acara:", err);
-      alert("Terjadi kendala saat export PDF. Anda juga dapat menggunakan Cetak / Simpan PDF langsung dari browser.");
+      setActionMessage({
+        type: "error",
+        text: `Gagal export PDF (${err?.message || "kesalahan internal"}). Coba gunakan tombol Cetak / Simpan PDF.`,
+      });
     } finally {
       setIsExportingPdf(false);
       setExportProgress("");
@@ -1108,9 +1545,17 @@ export function PrintBeritaAcara({
 
   // Browser print
   const handleBrowserPrint = () => {
+    setActionMessage(null);
     setActiveTab("preview");
     setTimeout(() => {
-      window.print();
+      try {
+        window.print();
+      } catch {
+        setActionMessage({
+          type: "error",
+          text: "Dialog cetak browser diblokir oleh tampilan sematan. Gunakan tombol hijau 'Unduh File PDF'.",
+        });
+      }
     }, 150);
   };
 
@@ -1123,9 +1568,13 @@ export function PrintBeritaAcara({
             size: A4 portrait;
             margin: 8mm 8mm 8mm 8mm;
           }
-          body {
-            visibility: hidden !important;
+          html, body {
+            height: auto !important;
+            overflow: visible !important;
             background: white !important;
+          }
+          body * {
+            visibility: hidden !important;
           }
           #print-modal-portal, #print-modal-portal * {
             visibility: visible !important;
@@ -1135,10 +1584,21 @@ export function PrintBeritaAcara({
             left: 0 !important;
             top: 0 !important;
             width: 100% !important;
+            height: auto !important;
             background: white !important;
             padding: 0 !important;
             margin: 0 !important;
             overflow: visible !important;
+            display: block !important;
+          }
+          .print-modal-card, .print-scroll-body {
+            max-height: none !important;
+            height: auto !important;
+            overflow: visible !important;
+            box-shadow: none !important;
+            border: none !important;
+            background: white !important;
+            padding: 0 !important;
           }
           .no-print {
             display: none !important;
@@ -1161,7 +1621,7 @@ export function PrintBeritaAcara({
         }
       `}</style>
 
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-5xl max-h-[96vh] flex flex-col overflow-hidden border border-slate-200">
+      <div className="print-modal-card bg-white rounded-2xl shadow-2xl w-full max-w-5xl max-h-[96vh] flex flex-col overflow-hidden border border-slate-200">
         {/* Header Bar */}
         <div className="no-print p-4 bg-gradient-to-r from-indigo-700 to-indigo-900 text-white flex flex-wrap justify-between items-center gap-3 border-b border-indigo-950">
           <div className="flex items-center gap-3">
@@ -1294,8 +1754,28 @@ export function PrintBeritaAcara({
           </div>
         </div>
 
+        {/* Inline Feedback Banner */}
+        {actionMessage && (
+          <div
+            className={`no-print px-4 py-2 text-xs font-bold flex items-center justify-between border-b ${
+              actionMessage.type === "success"
+                ? "bg-emerald-50 text-emerald-800 border-emerald-200"
+                : "bg-rose-50 text-rose-800 border-rose-200"
+            }`}
+          >
+            <span>{actionMessage.text}</span>
+            <button
+              type="button"
+              onClick={() => setActionMessage(null)}
+              className="ml-3 px-2 py-0.5 rounded hover:bg-black/5 text-[11px] cursor-pointer"
+            >
+              Tutup
+            </button>
+          </div>
+        )}
+
         {/* Modal Body */}
-        <div className="flex-1 overflow-y-auto bg-slate-200/70 p-3 sm:p-6 text-slate-800">
+        <div className="print-scroll-body flex-1 overflow-y-auto bg-slate-200/70 p-3 sm:p-6 text-slate-800">
           {/* TAB: SETTINGS & CHECKLIST */}
           {activeTab === "settings" && (
             <div className="no-print max-w-3xl mx-auto space-y-6">

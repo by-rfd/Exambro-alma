@@ -1,4 +1,4 @@
-import { getDB, setDB, syncSingleSession } from "../firebaseConfig";
+import { getDB, setDB, syncSingleSession, syncSingleHasil } from "../firebaseConfig";
 import { HasilUjian, Mapel, SesiSiswa, Soal } from "../types";
 
 export interface ForceSubmitOutcome {
@@ -61,7 +61,7 @@ export function executeForceSubmitSession(sessionTarget: SesiSiswa | any): Force
   const nilai = denominator > 0 ? Math.round((benar / denominator) * 100) : 0;
 
   const resultRecord: HasilUjian = {
-    id: `h_${ses.id}_${resolvedMapelId || "exam"}_${Date.now()}`,
+    id: `h_${ses.id}_${resolvedMapelId || "exam"}`,
     siswaNisn: ses.id,
     siswaNama: ses.siswaNama,
     siswaKelas: ses.siswaKelas,
@@ -75,18 +75,17 @@ export function executeForceSubmitSession(sessionTarget: SesiSiswa | any): Force
     status: "Selesai",
   };
 
-  // Replace any older result for this student + mapel so there are no duplicate rows
+  // Replace any older result for this student + mapel atomically so there are no duplicate rows or overwrites
   const prevHasil: HasilUjian[] = getDB.hasil();
-  const nextHasil = prevHasil.filter(
-    (h) =>
-      !(
+  const oldMatchingIds = prevHasil
+    .filter(
+      (h) =>
         (h.siswaNisn === ses.id ||
           (h.siswaNama || "").trim().toLowerCase() === (ses.siswaNama || "").trim().toLowerCase()) &&
         (h.mapelNama || "").trim().toLowerCase() === (resultRecord.mapelNama || "").trim().toLowerCase()
-      )
-  );
-  nextHasil.push(resultRecord);
-  setDB.hasil(nextHasil);
+    )
+    .map((h) => h.id);
+  syncSingleHasil(resultRecord, oldMatchingIds);
 
   const updatedSession: SesiSiswa = {
     ...ses,

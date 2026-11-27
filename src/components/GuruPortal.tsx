@@ -6,6 +6,7 @@ import {
   getSyncStatus,
   subscribeToSyncStatus,
   clearSyncError,
+  forceSyncNow,
   SyncStatus,
 } from "../firebaseConfig";
 import { Soal, GuruAmpuan } from "../types";
@@ -39,10 +40,12 @@ import * as XLSX from "xlsx";
 import {
   parseMassSoalText,
   buildSoalObjectsFromParsed,
+  applyWordPasteToInput,
   MassSoalParseResult,
   OpsiKey,
 } from "../utils/massSoalParser";
 import { parseDocxSoalFile } from "../utils/docxSoalParser";
+import { sortSoalByUploadOrder } from "../utils/examQuestionFilter";
 import { compressImageFile } from "../utils/imageUtils";
 import RichMathText from "./RichMathText";
 
@@ -278,7 +281,7 @@ export default function GuruPortal({ onLogout, guruUser }: GuruPortalProps) {
         continue;
       }
       try {
-        const compressed = await compressImageFile(file, 900, 0.78);
+        const compressed = await compressImageFile(file, 720, 0.72);
         setMassImages((prev) => [
           ...prev,
           {
@@ -482,7 +485,7 @@ export default function GuruPortal({ onLogout, guruUser }: GuruPortalProps) {
       return;
     }
     try {
-      const compressed = await compressImageFile(file, 900, 0.78);
+      const compressed = await compressImageFile(file, 720, 0.72);
       setImgUrl(compressed);
     } catch {
       showToast("Gagal memproses berkas gambar.", "error");
@@ -508,14 +511,16 @@ export default function GuruPortal({ onLogout, guruUser }: GuruPortalProps) {
     });
 
     const items = [...(getDB.soal() as Soal[])];
+    const nowTs = Date.now();
     const newSoal: Soal = {
-      id: "soal_guru_" + Date.now(),
+      id: "soal_guru_" + nowTs,
       mapelId: soalMapel,
       teks: soalTeks.trim() || "(Lihat gambar soal di atas)",
       opsi: { ...opsi },
       kunci: soalKunci,
       guruId: currentGuru.id,
       kelasIds: effectiveKelasIds,
+      createdAt: nowTs,
     };
     if (soalImg && soalImg.trim()) {
       newSoal.gambarUrl = soalImg.trim();
@@ -976,14 +981,33 @@ export default function GuruPortal({ onLogout, guruUser }: GuruPortalProps) {
               {dbState.konfig.namaSekolah}
             </h2>
           </div>
-          <div className="text-[10px] font-bold px-2.5 py-1 rounded-lg border bg-slate-50 border-slate-200 text-slate-600 flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => {
+              void forceSyncNow(true);
+            }}
+            title="Klik untuk sinkronisasi paksa dengan server"
+            className="text-[10px] font-bold px-2.5 py-1 rounded-lg border bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100 flex items-center gap-1.5 cursor-pointer transition"
+          >
             <span
               className={`w-2 h-2 rounded-full ${
-                syncStatus.pendingCount > 0 ? "bg-amber-500 animate-ping" : "bg-emerald-500"
+                syncStatus.lastError
+                  ? "bg-rose-500"
+                  : !syncStatus.cloudReady || syncStatus.pendingCount > 0
+                  ? "bg-amber-500 animate-ping"
+                  : "bg-emerald-500"
               }`}
             />
-            <span>{syncStatus.pendingCount > 0 ? "Menyimpan ke Cloud..." : "Tersinkron Realtime"}</span>
-          </div>
+            <span>
+              {syncStatus.lastError
+                ? "Sinkronkan Ulang"
+                : !syncStatus.cloudReady
+                ? "Memuat Database..."
+                : syncStatus.pendingCount > 0
+                ? "Menyimpan ke Cloud..."
+                : "Tersinkron Realtime"}
+            </span>
+          </button>
         </div>
 
         {guruMapels.length === 0 && (
@@ -1187,6 +1211,7 @@ export default function GuruPortal({ onLogout, guruUser }: GuruPortalProps) {
                           rows={3}
                           value={soalTeks}
                           onChange={(e) => setSoalTeks(e.target.value)}
+                          onPaste={(e) => applyWordPasteToInput(e, setSoalTeks)}
                           placeholder="Tuliskan pertanyaan ujian (Bahasa Indonesia / Arab / Inggris / Rumus Matematika seperti $\frac{1}{2}$ atau $\sqrt{16}$)..."
                           className="w-full p-2.5 bg-white border border-slate-200 rounded-xl text-slate-800 font-sans focus:outline-none focus:border-[#0666AE]"
                         />
@@ -1333,7 +1358,7 @@ export default function GuruPortal({ onLogout, guruUser }: GuruPortalProps) {
                                 UPLOAD FILE WORD (.DOCX) LANGSUNG
                               </p>
                               <p className="text-[9.5px] text-slate-600 font-semibold">
-                                Otomatis membaca soal, gambar soal & gambar opsi, Bahasa Arab, Inggris, & Rumus Matematika Word!
+                                Otomatis membaca soal, tabel, kata bergaris bawah, gambar soal & gambar opsi, Bahasa Arab, Inggris, & Rumus Matematika Word!
                               </p>
                             </div>
                           </div>
@@ -1398,7 +1423,14 @@ export default function GuruPortal({ onLogout, guruUser }: GuruPortalProps) {
                             setMassDocxName("");
                             setMassText(e.target.value);
                           }}
-                          placeholder="Upload .docx di atas ATAU salin/tempel soal Anda di sini (mendukung penomoran 1./١., opsi A-E / أ ب ج د هـ, Bahasa Arab, Inggris, & Rumus Matematika $...$)..."
+                          onPaste={(e) =>
+                            applyWordPasteToInput(e, (next) => {
+                              setMassDocxResult(null);
+                              setMassDocxName("");
+                              setMassText(next);
+                            })
+                          }
+                          placeholder="Upload .docx di atas ATAU salin/tempel soal Anda di sini (mendukung penomoran 1./١., opsi A-E / أ ب ج د هـ, Bahasa Arab, Inggris, tabel, kata bergaris bawah & Rumus Matematika $...$)..."
                           className="w-full p-2.5 bg-white border border-slate-200 rounded-xl text-slate-800 font-mono text-[10px] leading-tight focus:outline-none focus:border-[#0666AE]"
                         />
                       </div>
@@ -1692,11 +1724,16 @@ export default function GuruPortal({ onLogout, guruUser }: GuruPortalProps) {
                       groupsRecord[key].soalList.push(soal);
                     });
 
-                    const guruGroupedList = Object.values(groupsRecord).sort((a, b) => {
-                      const mComp = a.mapelNama.localeCompare(b.mapelNama);
-                      if (mComp !== 0) return mComp;
-                      return a.kelasLabel.localeCompare(b.kelasLabel);
-                    });
+                    const guruGroupedList = Object.values(groupsRecord)
+                      .map((g) => ({
+                        ...g,
+                        soalList: sortSoalByUploadOrder(g.soalList),
+                      }))
+                      .sort((a, b) => {
+                        const mComp = a.mapelNama.localeCompare(b.mapelNama);
+                        if (mComp !== 0) return mComp;
+                        return a.kelasLabel.localeCompare(b.kelasLabel);
+                      });
 
                     return (
                       <div className="space-y-3 max-h-[650px] overflow-y-auto pr-1">
@@ -2307,13 +2344,21 @@ export default function GuruPortal({ onLogout, guruUser }: GuruPortalProps) {
                 <div className="space-y-1">
                   <label className="text-[10px] text-slate-500 font-extrabold uppercase my-1 block">Pertanyaan / Teks Soal</label>
                   <textarea
+                    dir="auto"
                     rows={4}
                     value={editGuruSoalTeks}
                     onChange={(e) => setEditGuruSoalTeks(e.target.value)}
+                    onPaste={(e) => applyWordPasteToInput(e, setEditGuruSoalTeks)}
                     className="w-full p-2.5 bg-white border border-slate-200 rounded-xl text-slate-800 font-medium focus:outline-none focus:border-[#0666AE]"
                     placeholder="Tuliskan pertanyaan ujian..."
                     required
                   />
+                  {editGuruSoalTeks.trim() && (
+                    <div className="p-2 bg-slate-50 border border-slate-200 rounded-xl text-[11px] text-slate-700">
+                      <span className="text-[9px] font-black uppercase text-slate-400 block mb-0.5">Pratinjau:</span>
+                      <RichMathText text={editGuruSoalTeks} />
+                    </div>
+                  )}
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

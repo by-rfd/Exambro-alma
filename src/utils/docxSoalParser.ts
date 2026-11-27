@@ -28,14 +28,18 @@ function getFirstChildByLocalName(el: Element, localName: string): Element | nul
 }
 
 function getAttr(el: Element, attrName: string): string {
-  return (
+  const direct =
     el.getAttribute(`m:${attrName}`) ||
     el.getAttribute(`w:${attrName}`) ||
     el.getAttributeNS(OMML_NS, attrName) ||
     el.getAttributeNS(W_NS, attrName) ||
-    el.getAttribute(attrName) ||
-    ""
-  );
+    el.getAttribute(attrName);
+  if (direct) return direct;
+  for (let i = 0; i < el.attributes.length; i++) {
+    const attr = el.attributes[i];
+    if (attr.localName === attrName) return attr.value;
+  }
+  return "";
 }
 
 const UNICODE_MATH_TO_LATEX: Record<string, string> = {
@@ -349,6 +353,149 @@ async function parseDocxNumbering(zip: JSZip): Promise<{
   };
 }
 
+async function parseUnderlinedStyleIds(zip: JSZip): Promise<{
+  underlinedStyles: Set<string>;
+  defaultUnderlined: boolean;
+}> {
+  const underlinedStyles = new Set<string>();
+  let defaultUnderlined = false;
+  const stylesFile = zip.file("word/styles.xml");
+  if (!stylesFile) return { underlinedStyles, defaultUnderlined };
+
+  try {
+    const xmlStr = await stylesFile.async("string");
+    const doc = new DOMParser().parseFromString(xmlStr, "application/xml");
+
+    // Check docDefaults -> rPrDefault -> rPr -> u
+    const docDefaults = doc.getElementsByTagNameNS("*", "docDefaults")[0];
+    if (docDefaults) {
+      const rPrDefault = getFirstChildByLocalName(docDefaults, "rPrDefault");
+      const defRPr = rPrDefault ? getFirstChildByLocalName(rPrDefault, "rPr") : null;
+      const uEl = defRPr ? getFirstChildByLocalName(defRPr, "u") : null;
+      if (uEl) {
+        const uVal = (getAttr(uEl, "val") || "single").toLowerCase();
+        defaultUnderlined = uVal !== "none" && uVal !== "false" && uVal !== "0";
+      }
+    }
+
+    const styleExplicitU = new Map<string, boolean | null>();
+    const styleBasedOn = new Map<string, string>();
+    const styles = doc.getElementsByTagNameNS("*", "style");
+    for (let i = 0; i < styles.length; i++) {
+      const st = styles[i];
+      const styleId = getAttr(st, "styleId");
+      if (!styleId) continue;
+      const basedOnEl = getFirstChildByLocalName(st, "basedOn");
+      const basedOnId = basedOnEl ? getAttr(basedOnEl, "val") : "";
+      if (basedOnId) styleBasedOn.set(styleId, basedOnId);
+
+      const rPr = getFirstChildByLocalName(st, "rPr");
+      const uEl = rPr ? getFirstChildByLocalName(rPr, "u") : null;
+      if (uEl) {
+        const uVal = (getAttr(uEl, "val") || "single").toLowerCase();
+        styleExplicitU.set(styleId, uVal !== "none" && uVal !== "false" && uVal !== "0");
+      } else {
+        styleExplicitU.set(styleId, null);
+      }
+    }
+
+    const resolveStyle = (styleId: string, visited = new Set<string>()): boolean => {
+      if (!styleId || visited.has(styleId)) return defaultUnderlined;
+      visited.add(styleId);
+      const explicit = styleExplicitU.get(styleId);
+      if (explicit === true) return true;
+      if (explicit === false) return false;
+      const parent = styleBasedOn.get(styleId);
+      if (parent) return resolveStyle(parent, visited);
+      return defaultUnderlined;
+    };
+
+    styleExplicitU.forEach((_val, styleId) => {
+      if (resolveStyle(styleId)) {
+        underlinedStyles.add(styleId);
+      }
+    });
+  } catch {
+    // Ignore styles parse failures gracefully
+  }
+  return { underlinedStyles, defaultUnderlined };
+}
+
+function normalizeUnderlineTags(raw: string): string {
+  if (!raw.includes("<u>")) return raw;
+  // Merge immediately adjacent </u><u> runs (split across Word runs) into a single underline span
+  let res = raw.replace(/<\/u><u>/g, "");
+  // Move leading/trailing ASCII whitespace [ \t\r\n] out of <u>...</u>, while keeping \u00A0 (underlined fill-in-the-blank)
+  res = res.replace(/<u>([\s\S]*?)<\/u>/g, (_m, inner: string) => {
+    const leadMatch = inner.match(/^([ \t\r\n]*)/);
+    const trailMatch = inner.match(/([ \t\r\n]*)$/);
+    const lead = leadMatch ? leadMatch[1] : "";
+    const trail = trailMatch ? trailMatch[1] : "";
+    const core = inner.slice(lead.length, inner.length - trail.length);
+    if (!core) {
+      if (/\t/.test(inner) || inner.length >= 2) {
+        return `<u>${"\u00A0".repeat(Math.min(12, Math.max(4, inner.replace(/\t/g, "    ").length)))}</u>`;
+      }
+      return inner;
+    }
+    return `${lead}<u>${core}</u>${trail}`;
+  });
+  return res;
+}
+
+function stripUnderlineTags(text: string): string {
+  return text.replace(/<\/?u>/gi, "");
+}
+
+function isOptionCellStart(cellText: string, allowColonOnly = true): boolean {
+  const firstLine = stripUnderlineTags(cellText).trim().split(/\r?\n/)[0]?.trim() || "";
+  if (!firstLine) return false;
+  if (allowColonOnly) {
+    return (
+      /^\*{0,2}\s*[\(\[]?[A-E][\)\]]\s*[\.\-:]?/i.test(firstLine) ||
+      /^\*{0,2}\s*[A-E]\s*[\.\)\:]/i.test(firstLine) ||
+      /^\*{0,2}\s*[\(\[]?(?:أ|ب|ج|د|هـ)[\)\]]?\s*[\.\)\-:]/i.test(firstLine)
+    );
+  }
+  return (
+    /^\*{0,2}\s*[\(\[][A-E][\)\]]\s*[\.\-:]?/i.test(firstLine) ||
+    /^\*{0,2}\s*[A-E]\s*[\.\)]/i.test(firstLine) ||
+    /^\*{0,2}\s*[\(\[]?(?:أ|ب|ج|د|هـ)[\)\]]?\s*[\.\)\-]/i.test(firstLine)
+  );
+}
+
+function hasInlineOptionPair(text: string): boolean {
+  const clean = stripUnderlineTags(text);
+  const lines = clean.split(/\r?\n/);
+  let count = 0;
+  for (const line of lines) {
+    const t = line.trim();
+    if (
+      /^\*{0,2}\s*[\(\[]?[A-E][\)\]]?\s*[\.\)\:]\s*/i.test(t) ||
+      /^\*{0,2}\s*[\(\[]?(?:أ|ب|ج|د|هـ)[\)\]]?\s*[\.\)\-:]\s*/.test(t)
+    ) {
+      count++;
+    }
+    if (/(?:^|\s)\(?A\)?[\.\)]\s+.+\s+\(?B\)?[\.\)]\s+/i.test(t)) {
+      return true;
+    }
+  }
+  return count >= 2;
+}
+
+interface ParsedWordCell {
+  text: string;
+  colSpan: number;
+  rowSpan: number;
+  align: "left" | "center" | "right";
+  isHeaderStyle: boolean;
+}
+
+interface ParsedWordRow {
+  isTblHeader: boolean;
+  cells: ParsedWordCell[];
+}
+
 export interface DocxParseOutput {
   rawExtractedText: string;
   parsed: MassSoalParseResult;
@@ -394,14 +541,15 @@ export async function parseDocxSoalFile(file: File): Promise<DocxParseOutput> {
         const uint8 = await mediaFile.async("uint8array");
         const mime = getMimeFromExt(normalizedPath);
         const blob = new Blob([uint8], { type: mime });
-        const compressed = await compressImageBlobToDataUrl(blob, 900, 0.78);
+        const compressed = await compressImageBlobToDataUrl(blob, 720, 0.72);
         rIdToDataUrl.set(id, compressed);
       }
     }
   }
 
-  // 2. Prepare numbering helper
+  // 2. Prepare numbering & underline style helpers
   const numbering = await parseDocxNumbering(zip);
+  const { underlinedStyles: underlinedStyleIds, defaultUnderlined } = await parseUnderlinedStyleIds(zip);
 
   // 3. Parse word/document.xml
   const docXml = await docXmlFile.async("string");
@@ -411,11 +559,27 @@ export async function parseDocxSoalFile(file: File): Promise<DocxParseOutput> {
     throw new Error("Struktur isi dokumen Word tidak ditemukan.");
   }
 
+  const getParagraphAlignment = (pEl: Element): "left" | "center" | "right" => {
+    const pPr = getFirstChildByLocalName(pEl, "pPr");
+    if (!pPr) return "left";
+    const jcEl = getFirstChildByLocalName(pPr, "jc");
+    const jcVal = jcEl ? getAttr(jcEl, "val").toLowerCase() : "";
+    if (jcVal === "center") return "center";
+    if (jcVal === "right" || jcVal === "end") return "right";
+    const bidiEl = getFirstChildByLocalName(pPr, "bidi");
+    if (bidiEl && getAttr(bidiEl, "val") !== "0") return "right";
+    return "left";
+  };
+
   const extractParagraphText = (pEl: Element, includeNumPrefix = true): string => {
     let prefix = "";
-    if (includeNumPrefix) {
-      const pPr = getFirstChildByLocalName(pEl, "pPr");
-      const numPr = pPr ? getFirstChildByLocalName(pPr, "numPr") : null;
+    const pPr = getFirstChildByLocalName(pEl, "pPr");
+    const pStyleEl = pPr ? getFirstChildByLocalName(pPr, "pStyle") : null;
+    const pStyleId = pStyleEl ? getAttr(pStyleEl, "val") : "";
+    const pStyleUnderlined = pStyleId ? underlinedStyleIds.has(pStyleId) : defaultUnderlined;
+
+    if (includeNumPrefix && pPr) {
+      const numPr = getFirstChildByLocalName(pPr, "numPr");
       if (numPr) {
         const numIdEl = getFirstChildByLocalName(numPr, "numId");
         const ilvlEl = getFirstChildByLocalName(numPr, "ilvl");
@@ -432,10 +596,22 @@ export async function parseDocxSoalFile(file: File): Promise<DocxParseOutput> {
     const walkInline = (el: Element) => {
       const lname = el.localName;
 
+      // Skip tracked deletions and AlternateContent fallback
+      if (lname === "Fallback" || lname === "del") return;
+
       if (lname === "oMathPara" || lname === "oMath") {
         const latex = ommlNodeToLatex(el).trim();
         if (latex) {
           lineAcc += ` $${latex}$ `;
+        }
+        return;
+      }
+
+      if (lname === "txbxContent") {
+        const tbLines: string[] = [];
+        walkBlockContainer(el, tbLines);
+        if (tbLines.length > 0) {
+          lineAcc += `\n${tbLines.join("\n")}\n`;
         }
         return;
       }
@@ -445,31 +621,69 @@ export async function parseDocxSoalFile(file: File): Promise<DocxParseOutput> {
         const vertAlignEl = rPr ? getFirstChildByLocalName(rPr, "vertAlign") : null;
         const vertAlign = vertAlignEl ? getAttr(vertAlignEl, "val") : "";
 
+        // Detect underline on <w:u>, <w:rStyle>, or inherited <w:pStyle>
+        const uEl = rPr ? getFirstChildByLocalName(rPr, "u") : null;
+        const rStyleEl = rPr ? getFirstChildByLocalName(rPr, "rStyle") : null;
+        const rStyleId = rStyleEl ? getAttr(rStyleEl, "val") : "";
+        let isUnderlined = false;
+        if (uEl) {
+          const uVal = (getAttr(uEl, "val") || "single").toLowerCase();
+          isUnderlined = uVal !== "none" && uVal !== "false" && uVal !== "0";
+        } else if (rStyleId) {
+          isUnderlined = underlinedStyleIds.has(rStyleId);
+        } else if (pStyleUnderlined) {
+          isUnderlined = true;
+        }
+
         let runText = "";
+        const flushRunSegment = () => {
+          if (!runText) return;
+          let formatted = runText;
+          if (vertAlign === "superscript") {
+            formatted = `$^{${runText}}$`;
+          } else if (vertAlign === "subscript") {
+            formatted = `$_{${runText}}$`;
+          }
+
+          if (isUnderlined) {
+            if (formatted.trim().length > 0) {
+              lineAcc += `<u>${formatted}</u>`;
+            } else if (/[\t]/.test(formatted) || formatted.length >= 2) {
+              // Underlined fill-in-the-blank spaces/tabs in English questions (e.g. "She _____ goes")
+              const blankCount = Math.min(
+                12,
+                Math.max(4, formatted.replace(/\t/g, "    ").length)
+              );
+              lineAcc += `<u>${"\u00A0".repeat(blankCount)}</u>`;
+            } else {
+              // Single space inside an underlined phrase joins adjacent <u> runs cleanly
+              lineAcc += `<u>${formatted}</u>`;
+            }
+          } else {
+            lineAcc += formatted;
+          }
+          runText = "";
+        };
+
         for (let i = 0; i < el.childNodes.length; i++) {
           const ch = el.childNodes[i];
           if (ch.nodeType !== 1) continue;
           const chEl = ch as Element;
-          if (chEl.localName === "t" || chEl.localName === "delText") {
+          if (chEl.localName === "t") {
             runText += chEl.textContent || "";
+          } else if (chEl.localName === "noBreakHyphen") {
+            runText += "-";
           } else if (chEl.localName === "tab") {
             runText += "\t";
           } else if (chEl.localName === "br" || chEl.localName === "cr") {
-            runText += "\n";
+            flushRunSegment();
+            lineAcc += "\n";
           } else if (chEl.localName === "drawing" || chEl.localName === "pict" || chEl.localName === "object") {
+            flushRunSegment();
             walkInline(chEl);
           }
         }
-
-        if (runText) {
-          if (vertAlign === "superscript") {
-            lineAcc += `$^{${runText}}$`;
-          } else if (vertAlign === "subscript") {
-            lineAcc += `$_{${runText}}$`;
-          } else {
-            lineAcc += runText;
-          }
-        }
+        flushRunSegment();
         return;
       }
 
@@ -521,67 +735,293 @@ export async function parseDocxSoalFile(file: File): Promise<DocxParseOutput> {
       }
     }
 
-    const cleaned = lineAcc.replace(/[ ]{2,}/g, " ").trim();
+    const cleaned = normalizeUnderlineTags(lineAcc.replace(/[ ]{2,}/g, " ").trim());
     if (!cleaned) return "";
     // Avoid doubling prefix if teacher already typed "1." or "A." manually alongside Word numbering
-    if (prefix && /^(?:\d+[\.\)]|[A-E][\.\)]|[أبجدهـ][\.\)])/i.test(cleaned)) {
+    const cleanedNoU = stripUnderlineTags(cleaned);
+    if (prefix && /^(?:\d+[\.\)]|[A-E][\.\)]|[أبجدهـ][\.\)])/i.test(cleanedNoU)) {
       return cleaned;
     }
     return `${prefix}${cleaned}`.trim();
   };
 
-  const outLines: string[] = [];
+  const serializeDataTable = (rows: ParsedWordRow[]): string => {
+    const hasHeader = rows.length > 1 && (rows[0].isTblHeader || rows[0].cells.some((c) => c.isHeaderStyle));
+    const trHtml = rows
+      .map((row, rIdx) => {
+        const tag = hasHeader && rIdx === 0 ? "th" : "td";
+        const cellHtml = row.cells
+          .map((cell) => {
+            const attrs: string[] = [];
+            if (cell.colSpan > 1) attrs.push(`colspan="${cell.colSpan}"`);
+            if (cell.rowSpan > 1) attrs.push(`rowspan="${cell.rowSpan}"`);
+            if (cell.align !== "left") attrs.push(`data-align="${cell.align}"`);
 
-  for (let i = 0; i < body.childNodes.length; i++) {
-    const node = body.childNodes[i];
-    if (node.nodeType !== 1) continue;
-    const el = node as Element;
+            // Preserve math & underline inside table cell; convert inline IMG_TOKEN to <img> and newlines to <br/>
+            const safeBody = cell.text
+              .replace(
+                /\[\[IMG_TOKEN:(data:image\/[^\]]+|https?:\/\/[^\]]+)\]\]/g,
+                (_m, url: string) => `<img src="${url.trim()}" />`
+              )
+              .replace(/\r?\n/g, "<br/>");
+            const attrStr = attrs.length > 0 ? ` ${attrs.join(" ")}` : "";
+            return `<${tag}${attrStr}>${safeBody}</${tag}>`;
+          })
+          .join("");
+        return `<tr>${cellHtml}</tr>`;
+      })
+      .join("");
+    return `<table>${trHtml}</table>`;
+  };
 
-    if (el.localName === "p") {
-      const txt = extractParagraphText(el, true);
-      if (txt) {
-        outLines.push(txt);
-      }
-    } else if (el.localName === "tbl") {
-      // Walk Word table rows cleanly:
-      // Case A: Header row like [No | Soal | Opsi A | ...] or vertical Q blocks per cell
-      const rows = getChildrenByLocalName(el, "tr");
-      for (const tr of rows) {
-        const cells = getChildrenByLocalName(tr, "tc");
-        const cellTexts = cells.map((tc) => {
-          const pLines: string[] = [];
-          for (let c = 0; c < tc.childNodes.length; c++) {
-            const ch = tc.childNodes[c];
-            if (ch.nodeType === 1 && (ch as Element).localName === "p") {
-              const t = extractParagraphText(ch as Element, true);
-              if (t) pLines.push(t);
-            }
+  const processTableElement = (tblEl: Element): string[] => {
+    const trEls = getChildrenByLocalName(tblEl, "tr");
+    if (trEls.length === 0) return [];
+
+    // 1. Parse full table grid with colspan (gridSpan) & rowspan (vMerge)
+    const parsedRows: ParsedWordRow[] = [];
+    const activeVerticalMerges = new Map<number, { rowIdx: number; cellIdxInRow: number }>();
+
+    for (let rIdx = 0; rIdx < trEls.length; rIdx++) {
+      const tr = trEls[rIdx];
+      const trPr = getFirstChildByLocalName(tr, "trPr");
+      const isTblHeader = Boolean(trPr && getFirstChildByLocalName(trPr, "tblHeader"));
+      const tcEls = getChildrenByLocalName(tr, "tc");
+
+      const rowCells: ParsedWordCell[] = [];
+      let colCursor = 0;
+
+      for (const tc of tcEls) {
+        const tcPr = getFirstChildByLocalName(tc, "tcPr");
+        const gridSpanEl = tcPr ? getFirstChildByLocalName(tcPr, "gridSpan") : null;
+        const colSpan = Math.max(1, parseInt((gridSpanEl && getAttr(gridSpanEl, "val")) || "1", 10) || 1);
+
+        const vMergeEl = tcPr ? getFirstChildByLocalName(tcPr, "vMerge") : null;
+        const vMergeVal = vMergeEl ? (getAttr(vMergeEl, "val") || "continue").toLowerCase() : "";
+
+        if (vMergeEl && vMergeVal === "continue" && activeVerticalMerges.has(colCursor)) {
+          const master = activeVerticalMerges.get(colCursor)!;
+          if (parsedRows[master.rowIdx]?.cells[master.cellIdxInRow]) {
+            parsedRows[master.rowIdx].cells[master.cellIdxInRow].rowSpan += 1;
           }
-          return pLines.join("\n");
-        }).filter((t) => t.trim().length > 0);
+          colCursor += colSpan;
+          continue;
+        }
 
-        if (cellTexts.length === 0) continue;
+        // Check header styling (shading or bold runs)
+        const shdEl = tcPr ? getFirstChildByLocalName(tcPr, "shd") : null;
+        const fillVal = shdEl ? (getAttr(shdEl, "fill") || "").toUpperCase() : "";
+        const hasShading = Boolean(fillVal && fillVal !== "AUTO" && fillVal !== "FFFFFF");
 
-        // If first cell is strictly a number ("1" or "1.") and second cell contains the question content:
-        const firstClean = cellTexts[0].trim();
-        if (cellTexts.length >= 2 && /^\d{1,3}[\.\)]?$/.test(firstClean)) {
+        const pLines: string[] = [];
+        let align: "left" | "center" | "right" = "left";
+        let boldRuns = 0;
+        let totalRuns = 0;
+
+        for (let c = 0; c < tc.childNodes.length; c++) {
+          const ch = tc.childNodes[c];
+          if (ch.nodeType !== 1) continue;
+          const chEl = ch as Element;
+          if (chEl.localName === "p") {
+            if (pLines.length === 0) {
+              align = getParagraphAlignment(chEl);
+            }
+            const rNodes = getChildrenByLocalName(chEl, "r");
+            for (const rn of rNodes) {
+              totalRuns++;
+              const rPr = getFirstChildByLocalName(rn, "rPr");
+              const bEl = rPr ? getFirstChildByLocalName(rPr, "b") : null;
+              if (bEl && getAttr(bEl, "val") !== "0") boldRuns++;
+            }
+            const t = extractParagraphText(chEl, true);
+            if (t) pLines.push(t);
+          } else if (chEl.localName === "tbl") {
+            const nestedLines = processTableElement(chEl);
+            pLines.push(...nestedLines);
+          }
+        }
+
+        const cellIdxInRow = rowCells.length;
+        rowCells.push({
+          text: pLines.join("\n"),
+          colSpan,
+          rowSpan: 1,
+          align,
+          isHeaderStyle: hasShading || (totalRuns > 0 && boldRuns === totalRuns),
+        });
+
+        if (vMergeEl && vMergeVal === "restart") {
+          activeVerticalMerges.set(colCursor, { rowIdx: parsedRows.length, cellIdxInRow });
+        } else {
+          for (let c = colCursor; c < colCursor + colSpan; c++) {
+            activeVerticalMerges.delete(c);
+          }
+        }
+
+        colCursor += colSpan;
+      }
+
+      parsedRows.push({ isTblHeader, cells: rowCells });
+    }
+
+    // Remove completely empty rows
+    const nonEmptyRows = parsedRows.filter((row) =>
+      row.cells.some((cell) => cell.text.trim().length > 0)
+    );
+    if (nonEmptyRows.length === 0) return [];
+
+    // 2. Classify Table: Exam Columnar Table vs Option Grid Layout vs Question Layout vs Data Table
+    // Case A: Columnar Exam Table with explicit header row (No | Soal | Opsi A | Opsi B | ... | Kunci)
+    if (nonEmptyRows.length >= 2 && nonEmptyRows[0].cells.length >= 3) {
+      const headerTexts = nonEmptyRows[0].cells.map((c) => stripUnderlineTags(c.text).trim().toLowerCase());
+      const soalCol = headerTexts.findIndex((h) => /\b(soal|pertanyaan|butir)\b/.test(h));
+      const noCol = headerTexts.findIndex((h) => /^(no\.?|nomor)$/.test(h));
+      const optACol = headerTexts.findIndex((h) => /^(?:opsi\s*|pilihan\s*)?a$/.test(h));
+      const optBCol = headerTexts.findIndex((h) => /^(?:opsi\s*|pilihan\s*)?b$/.test(h));
+      const optCCol = headerTexts.findIndex((h) => /^(?:opsi\s*|pilihan\s*)?c$/.test(h));
+      const optDCol = headerTexts.findIndex((h) => /^(?:opsi\s*|pilihan\s*)?d$/.test(h));
+      const optECol = headerTexts.findIndex((h) => /^(?:opsi\s*|pilihan\s*)?e$/.test(h));
+      const kunciCol = headerTexts.findIndex((h) => /^(kunci|jawaban|key|answer)$/.test(h));
+
+      if (soalCol !== -1 && optACol !== -1 && optBCol !== -1) {
+        const resultLines: string[] = [];
+        for (let r = 1; r < nonEmptyRows.length; r++) {
+          const cells = nonEmptyRows[r].cells;
+          const numRaw = noCol !== -1 ? stripUnderlineTags(cells[noCol]?.text || "").trim().replace(/[\.\)]$/, "") : String(r);
+          const qText = (cells[soalCol]?.text || "").trim();
+          if (!qText) continue;
+          const qLine = /^\d{1,3}[\.\)]/.test(stripUnderlineTags(qText)) ? qText : `${numRaw || r}. ${qText}`;
+          resultLines.push(qLine);
+          const pushOpt = (label: string, colIdx: number) => {
+            if (colIdx === -1) return;
+            const val = (cells[colIdx]?.text || "").trim();
+            if (!val) return;
+            resultLines.push(isOptionCellStart(val) ? val : `${label}. ${val}`);
+          };
+          pushOpt("A", optACol);
+          pushOpt("B", optBCol);
+          pushOpt("C", optCCol);
+          pushOpt("D", optDCol);
+          pushOpt("E", optECol);
+          if (kunciCol !== -1 && cells[kunciCol]?.text.trim()) {
+            resultLines.push(`Kunci: ${stripUnderlineTags(cells[kunciCol].text).trim()}`);
+          }
+        }
+        return resultLines;
+      }
+    }
+
+    // Gather structural clues across cells
+    const nonEmptyCells = nonEmptyRows.flatMap((r) => r.cells.filter((c) => c.text.trim().length > 0));
+    const optionCellCount = nonEmptyCells.filter((c) => isOptionCellStart(c.text, true)).length;
+    const strictOptionCellCount = nonEmptyCells.filter((c) => isOptionCellStart(c.text, false)).length;
+    const allCellsText = nonEmptyCells.map((c) => c.text).join("\n");
+    const hasOptionsInTable = hasInlineOptionPair(allCellsText) || strictOptionCellCount >= 2 || optionCellCount >= 3;
+    const sequentialNumericCol0 = nonEmptyRows.filter((r) =>
+      /^\d{1,3}[\.\)]?$/.test(stripUnderlineTags(r.cells[0]?.text || "").trim())
+    ).length;
+
+    // Case B: Option Grid Layout Table (e.g., | A. ... | C. ... | / | B. ... | D. ... | or | A. | Text |)
+    // Guard: avoid mistaking 2-speaker English dialogue tables ("| A: | ... |" / "| B: | ... |") for option grids
+    const row0LooksLikeDataHeader =
+      nonEmptyRows.length >= 2 &&
+      !isOptionCellStart(nonEmptyRows[0].cells[0]?.text || "", true) &&
+      nonEmptyRows[0].cells.some((c) => c.isHeaderStyle || nonEmptyRows[0].isTblHeader);
+
+    const isOptionGridLayout =
+      !row0LooksLikeDataHeader &&
+      (strictOptionCellCount >= 2 || optionCellCount >= 3) &&
+      (optionCellCount >= Math.ceil(nonEmptyCells.length * 0.4) ||
+        nonEmptyRows.every(
+          (r) =>
+            r.cells.some((c) => isOptionCellStart(c.text, true)) ||
+            r.cells.every((c) => !c.text.trim())
+        ));
+
+    if (isOptionGridLayout) {
+      const lines: string[] = [];
+      for (const row of nonEmptyRows) {
+        const filled = row.cells.map((c) => c.text.trim()).filter(Boolean);
+        if (filled.length === 0) continue;
+        // Handle | A. | Text | two-cell pair
+        if (
+          filled.length === 2 &&
+          /^\*{0,2}[\(\[]?(?:[A-E]|أ|ب|ج|د|هـ)[\)\]]?[\.\)\:]?$/i.test(stripUnderlineTags(filled[0]))
+        ) {
+          const keyToken = stripUnderlineTags(filled[0]);
+          const normalizedKey = /[\.\)\:]$/.test(keyToken) ? keyToken : `${keyToken}.`;
+          lines.push(`${normalizedKey} ${filled[1]}`);
+        } else {
+          for (const cellText of filled) {
+            lines.push(cellText);
+          }
+        }
+      }
+      return lines;
+    }
+
+    // Case C: Master Question-Wrapper Layout Table (e.g., | 1. | Question + Options A-E |)
+    const isQuestionWrapperTable =
+      hasOptionsInTable &&
+      (sequentialNumericCol0 >= 1 ||
+        nonEmptyRows.some((r) => r.cells.length <= 2 && hasInlineOptionPair(r.cells.map((c) => c.text).join("\n"))));
+
+    if (isQuestionWrapperTable) {
+      const lines: string[] = [];
+      for (const row of nonEmptyRows) {
+        const filled = row.cells.map((c) => c.text.trim()).filter(Boolean);
+        if (filled.length === 0) continue;
+        const firstClean = stripUnderlineTags(filled[0]).trim();
+        if (filled.length >= 2 && /^\d{1,3}[\.\)]?$/.test(firstClean)) {
           const qNum = firstClean.replace(/[\.\)]$/, "");
-          const restFirst = cellTexts[1];
-          const startsWithNum = /^\d{1,3}[\.\)]/.test(restFirst);
-          outLines.push(startsWithNum ? restFirst : `${qNum}. ${restFirst}`);
-          for (let ci = 2; ci < cellTexts.length; ci++) {
-            outLines.push(cellTexts[ci]);
+          const restFirst = filled[1];
+          const startsWithNum = /^\d{1,3}[\.\)]/.test(stripUnderlineTags(restFirst));
+          lines.push(startsWithNum ? restFirst : `${qNum}. ${restFirst}`);
+          for (let ci = 2; ci < filled.length; ci++) {
+            lines.push(filled[ci]);
           }
         } else {
-          // Multi-cell option row (e.g. ["A.", "Option text + img"] or ["A. ...", "B. ..."])
-          const merged = cellTexts.every((c) => !c.includes("\n"))
-            ? cellTexts.join("   ")
-            : cellTexts.join("\n");
-          outLines.push(merged);
+          for (const cellText of filled) {
+            lines.push(cellText);
+          }
         }
+      }
+      return lines;
+    }
+
+    // Case D: Real Content / Data Table inside a question or option!
+    return [serializeDataTable(nonEmptyRows)];
+  };
+
+  function walkBlockContainer(containerEl: Element, out: string[]) {
+    for (let i = 0; i < containerEl.childNodes.length; i++) {
+      const node = containerEl.childNodes[i];
+      if (node.nodeType !== 1) continue;
+      const el = node as Element;
+      const lname = el.localName;
+
+      if (lname === "p") {
+        const txt = extractParagraphText(el, true);
+        if (txt) {
+          out.push(txt);
+        }
+      } else if (lname === "tbl") {
+        const tblLines = processTableElement(el);
+        out.push(...tblLines);
+      } else if (
+        lname === "sdt" ||
+        lname === "sdtContent" ||
+        lname === "ins" ||
+        lname === "smartTag" ||
+        lname === "customXml"
+      ) {
+        walkBlockContainer(el, out);
       }
     }
   }
+
+  const outLines: string[] = [];
+  walkBlockContainer(body, outLines);
 
   const rawExtractedText = outLines.join("\n");
   const parsed = parseMassSoalText(rawExtractedText);

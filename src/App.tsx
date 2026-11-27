@@ -109,10 +109,9 @@ export default function App() {
         <div className="flex items-center gap-2.5 sm:gap-3 text-left w-full sm:w-auto justify-between sm:justify-start">
           <div className="flex items-center gap-2.5 sm:gap-3">
             <img
-              src="https://i.ibb.co.com/rfswjG1B/MA-AL-MA-SUM.png"
+              src="/school-logo.png"
               alt="MA Al-Ma'sum Logo"
               className="w-8 h-8 sm:w-10 sm:h-10 object-contain shrink-0"
-              referrerPolicy="no-referrer"
             />
             <div>
               <h1 className="text-xs sm:text-md font-extrabold tracking-tight text-slate-900 flex items-center gap-1.5 sm:gap-2">
@@ -165,10 +164,9 @@ export default function App() {
                   <div className="space-y-3">
                     <div className="flex justify-center items-center gap-3">
                       <img
-                        src="https://i.ibb.co.com/rfswjG1B/MA-AL-MA-SUM.png"
+                        src="/school-logo.png"
                         alt="MA Al-Ma'sum Logo"
                         className="w-16 h-16 object-contain drop-shadow-md animate-pulse"
-                        referrerPolicy="no-referrer"
                       />
                     </div>
                     <div>

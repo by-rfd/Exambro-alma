@@ -24,6 +24,7 @@ import type {
   HasilUjian,
   KonfigurasiSekolah,
 } from "./types";
+import { sortSoalByUploadOrder } from "./utils/examQuestionFilter";
 
 // Safe payload cleaner: recurses and removes any undefined fields
 export function cleanPayload<T>(obj: T): T {
@@ -296,8 +297,8 @@ const DEFAULT_KONFIGURASI: KonfigurasiSekolah = {
   namaSekolah: "MA AL-MA'SUM MALAUSMA",
   alamatSekolah: "Jl. Lapangan Olahraga No. 04, Malausma, Majalengka, Jawa Barat",
   kodeRegistrasi: "MA-ALMASUM-2026",
-  logoKiriUrl: "https://i.ibb.co.com/rfswjG1B/MA-AL-MA-SUM.png",
-  logoKananUrl: "https://i.ibb.co.com/rfswjG1B/MA-AL-MA-SUM.png",
+  logoKiriUrl: "/school-logo.png",
+  logoKananUrl: "/school-logo.png",
   bgUrl: "",
   ttdKepsekUrl: "",
   stempelSekolahUrl: "",
@@ -307,25 +308,131 @@ const DEFAULT_KONFIGURASI: KonfigurasiSekolah = {
   batasPelanggaran: 3,
 };
 
+const memoryCache = new Map<string, any>();
+
+// Lightweight IndexedDB store so >5MB collections (like 1,600+ questions with images) persist across refreshes
+const IDB_NAME = "exambro_cache_db";
+const IDB_STORE = "collections";
+
+function openIdb(): Promise<IDBDatabase | null> {
+  if (typeof window === "undefined" || !("indexedDB" in window)) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    try {
+      const req = window.indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) {
+          db.createObjectStore(IDB_STORE);
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+async function idbWrite(key: string, val: any): Promise<void> {
+  const idb = await openIdb();
+  if (!idb) return;
+  try {
+    const tx = idb.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).put(val, key);
+  } catch {
+    // ignore IDB write errors
+  }
+}
+
+async function idbRead<T = any>(key: string): Promise<T | undefined> {
+  const idb = await openIdb();
+  if (!idb) return undefined;
+  return new Promise((resolve) => {
+    try {
+      const tx = idb.transaction(IDB_STORE, "readonly");
+      const req = tx.objectStore(IDB_STORE).get(key);
+      req.onsuccess = () => resolve(req.result as T | undefined);
+      req.onerror = () => resolve(undefined);
+    } catch {
+      resolve(undefined);
+    }
+  });
+}
+
+let hasLiveSupabaseSoal = false;
+
+if (typeof window !== "undefined") {
+  try {
+    // Bebaskan kuota ~5MB browser dari cache bank soal lama agar sesi & konfigurasi selalu aman tersimpan
+    window.localStorage.removeItem("exambro_soal");
+  } catch {
+    // Abaikan jika browser membatasi akses localStorage
+  }
+  void idbRead<any[]>("soal").then((cachedSoal) => {
+    if (!hasLiveSupabaseSoal && Array.isArray(cachedSoal) && cachedSoal.length > 0 && !memoryCache.has("soal")) {
+      memoryCache.set("soal", sortSoalByUploadOrder(cachedSoal));
+      notifySync();
+    }
+  });
+}
+
+function safeWriteLocalStorage(key: string, serialized: string) {
+  if (typeof window === "undefined") return;
+  // Bank soal bisa >5MB sehingga disimpan di IndexedDB + memoryCache + Supabase, bukan localStorage
+  if (key === "soal" || serialized.length > 1_500_000) return;
+  try {
+    window.localStorage.setItem(`exambro_${key}`, serialized);
+  } catch (err) {
+    console.warn(`Penyimpanan lokal browser penuh untuk '${key}', dialihkan ke memori aktif:`, err);
+  }
+}
+
 const storage = {
   get: <T>(key: string, defaultValue: T): T => {
-    try {
-      const data = localStorage.getItem(`exambro_${key}`);
-      return data !== null ? JSON.parse(data) : defaultValue;
-    } catch {
-      return defaultValue;
+    if (memoryCache.has(key)) {
+      return memoryCache.get(key) as T;
     }
+    if (key !== "soal" && typeof window !== "undefined") {
+      try {
+        const data = window.localStorage.getItem(`exambro_${key}`);
+        if (data !== null) {
+          const parsed = JSON.parse(data);
+          memoryCache.set(key, parsed);
+          return parsed as T;
+        }
+      } catch {
+        return defaultValue;
+      }
+    }
+    return defaultValue;
   },
-  set: <T>(key: string, val: T): T => {
+  set: <T>(key: string, val: T, notify = true): T => {
+    const normalizedVal = key === "soal" && Array.isArray(val) ? (sortSoalByUploadOrder(val) as unknown as T) : val;
+    memoryCache.set(key, normalizedVal);
     try {
-      localStorage.setItem(`exambro_${key}`, JSON.stringify(val));
-      notifySync();
+      if (key === "soal") {
+        void idbWrite("soal", normalizedVal);
+      } else {
+        const serialized = JSON.stringify(normalizedVal);
+        safeWriteLocalStorage(key, serialized);
+        if (serialized.length > 1_500_000) {
+          void idbWrite(key, normalizedVal);
+        }
+      }
     } catch (e) {
-      console.error(e);
+      console.warn(`Gagal serialisasi cache '${key}':`, e);
     }
-    return val;
+    if (notify) notifySync();
+    return normalizedVal;
   },
 };
+
+export function updateLocalSessionCache(session: SesiSiswa) {
+  if (!session || !session.id) return;
+  const current = storage.get<SesiSiswa[]>("sessions", []);
+  const next = [...current.filter((s) => s.id !== session.id), session];
+  storage.set("sessions", next);
+}
 
 // ------------------------------------------------------------------------
 // SYNC STATUS & BACKEND PROVIDER MANAGEMENT
@@ -334,7 +441,9 @@ export type BackendProvider = "supabase" | "firestore-readonly" | "unconfigured"
 
 export interface SyncStatus {
   pendingCount: number;
+  outboxCount?: number;
   lastSavedAt: number | null;
+  lastSyncedAt?: number | null;
   lastError: string | null;
   cloudReady: boolean;
   quotaExceeded: boolean;
@@ -347,7 +456,9 @@ let activeStudentNisn = "";
 
 let currentSyncStatus: SyncStatus = {
   pendingCount: 0,
+  outboxCount: 0,
   lastSavedAt: null,
+  lastSyncedAt: null,
   lastError: null,
   cloudReady: false,
   quotaExceeded: false,
@@ -382,8 +493,13 @@ export function clearSyncError() {
 }
 
 export function setSyncMode(mode: "staff" | "student", studentNisn?: string) {
+  const nextNisn = mode === "student" && studentNisn ? studentNisn.trim() : "";
+  const changed = syncMode !== mode || activeStudentNisn !== nextNisn;
   syncMode = mode;
-  activeStudentNisn = mode === "student" && studentNisn ? studentNisn.trim() : "";
+  activeStudentNisn = nextNisn;
+  if (changed && activeProvider === "supabase") {
+    void fetchSupabaseBootstrap(false, false);
+  }
 }
 
 const recentlyDeletedDocIds = new Set<string>();
@@ -430,15 +546,222 @@ function stableStringify(val: any): string {
 }
 
 // ------------------------------------------------------------------------
-// SUPABASE SERVER PROXY TRANSPORT (/api/db/*)
+// SUPABASE SERVER PROXY TRANSPORT (/api/db/*) & PERSISTENT RETRY OUTBOX
 // ------------------------------------------------------------------------
 
-async function apiRequest<T = any>(url: string, options?: RequestInit): Promise<T> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 12000);
+const OUTBOX_STORAGE_KEY = "exambro_sync_outbox";
+
+type OutboxOp =
+  | { kind: "doc-put"; storageKey: string; docId: string; data: any; queuedAt: number }
+  | { kind: "collection-put"; storageKey: string; upserts: any[]; deleteIds: string[]; queuedAt: number }
+  | { kind: "doc-delete"; storageKey: string; docId: string; queuedAt: number }
+  | { kind: "collection-delete"; storageKey: string; queuedAt: number }
+  | { kind: "batch-delete"; storageKey: string; ids: string[]; queuedAt: number };
+
+function loadOutboxFromStorage(): OutboxOp[] {
+  if (typeof window === "undefined") return [];
   try {
+    const raw = window.localStorage.getItem(OUTBOX_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+let syncOutbox: OutboxOp[] = loadOutboxFromStorage();
+let activeWriteCount = 0;
+let outboxFlushInProgress = false;
+let outboxRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+function persistOutbox() {
+  if (typeof window !== "undefined") {
+    try {
+      if (syncOutbox.length === 0) {
+        window.localStorage.removeItem(OUTBOX_STORAGE_KEY);
+      } else {
+        const serialized = JSON.stringify(syncOutbox);
+        if (serialized.length <= 2_500_000) {
+          window.localStorage.setItem(OUTBOX_STORAGE_KEY, serialized);
+        }
+      }
+    } catch {
+      // Ignore localStorage quota errors; in-memory outbox remains active
+    }
+  }
+  currentSyncStatus = {
+    ...currentSyncStatus,
+    outboxCount: syncOutbox.length,
+    pendingCount: activeWriteCount + syncOutbox.length,
+  };
+  notifySyncStatus();
+}
+
+function scheduleOutboxFlush(delayMs = 3000) {
+  if (outboxRetryTimer || syncOutbox.length === 0) return;
+  outboxRetryTimer = setTimeout(() => {
+    outboxRetryTimer = null;
+    void flushSyncOutbox();
+  }, delayMs);
+}
+
+function enqueueOutboxOp(op: OutboxOp) {
+  if (op.kind === "doc-put") {
+    syncOutbox = syncOutbox.filter(
+      (existing) =>
+        !(
+          (existing.kind === "doc-put" || existing.kind === "doc-delete") &&
+          existing.storageKey === op.storageKey &&
+          existing.docId === op.docId
+        )
+    );
+    syncOutbox.push(op);
+  } else if (op.kind === "doc-delete") {
+    syncOutbox = syncOutbox.filter(
+      (existing) =>
+        !(
+          (existing.kind === "doc-put" || existing.kind === "doc-delete") &&
+          existing.storageKey === op.storageKey &&
+          existing.docId === op.docId
+        )
+    );
+    syncOutbox.push(op);
+  } else if (op.kind === "collection-delete") {
+    syncOutbox = syncOutbox.filter((existing) => existing.storageKey !== op.storageKey);
+    syncOutbox.push(op);
+  } else if (op.kind === "collection-put") {
+    const existingIdx = syncOutbox.findIndex(
+      (e) => e.kind === "collection-put" && e.storageKey === op.storageKey
+    );
+    if (existingIdx !== -1) {
+      const prev = syncOutbox[existingIdx] as Extract<OutboxOp, { kind: "collection-put" }>;
+      const upsertMap = new Map<string, any>();
+      (prev.upserts || []).forEach((u) => u?.id && upsertMap.set(u.id, u));
+      (op.upserts || []).forEach((u) => u?.id && upsertMap.set(u.id, u));
+      const deleteSet = new Set<string>([...(prev.deleteIds || []), ...(op.deleteIds || [])]);
+      upsertMap.forEach((_v, id) => deleteSet.delete(id));
+      syncOutbox[existingIdx] = {
+        kind: "collection-put",
+        storageKey: op.storageKey,
+        upserts: Array.from(upsertMap.values()),
+        deleteIds: Array.from(deleteSet),
+        queuedAt: op.queuedAt,
+      };
+    } else {
+      syncOutbox.push(op);
+    }
+  } else if (op.kind === "batch-delete") {
+    const existingIdx = syncOutbox.findIndex(
+      (e) => e.kind === "batch-delete" && e.storageKey === op.storageKey
+    );
+    if (existingIdx !== -1) {
+      const prev = syncOutbox[existingIdx] as Extract<OutboxOp, { kind: "batch-delete" }>;
+      syncOutbox[existingIdx] = {
+        kind: "batch-delete",
+        storageKey: op.storageKey,
+        ids: Array.from(new Set([...(prev.ids || []), ...(op.ids || [])])),
+        queuedAt: op.queuedAt,
+      };
+    } else {
+      syncOutbox.push(op);
+    }
+  }
+  persistOutbox();
+  scheduleOutboxFlush(3000);
+}
+
+async function executeOutboxOp(op: OutboxOp): Promise<void> {
+  if (op.kind === "doc-put") {
+    markDocWriteInFlight(op.storageKey, op.docId);
+    try {
+      await apiRequest(`/api/db/doc/${op.storageKey}/${encodeURIComponent(op.docId)}`, {
+        method: "PUT",
+        body: JSON.stringify({ item: cleanPayload(op.data) }),
+      });
+    } finally {
+      clearDocWriteInFlight(op.storageKey, op.docId);
+    }
+  } else if (op.kind === "collection-put") {
+    (op.upserts || []).forEach((u: any) => u?.id && markDocWriteInFlight(op.storageKey, u.id));
+    try {
+      await apiRequest(`/api/db/collection/${op.storageKey}`, {
+        method: "PUT",
+        body: JSON.stringify({ upserts: op.upserts, deleteIds: op.deleteIds }),
+      });
+    } finally {
+      (op.upserts || []).forEach((u: any) => u?.id && clearDocWriteInFlight(op.storageKey, u.id));
+    }
+  } else if (op.kind === "doc-delete") {
+    await apiRequest(`/api/db/doc/${op.storageKey}/${encodeURIComponent(op.docId)}`, {
+      method: "DELETE",
+    });
+  } else if (op.kind === "collection-delete") {
+    await apiRequest(`/api/db/collection/${op.storageKey}`, { method: "DELETE" });
+  } else if (op.kind === "batch-delete") {
+    await apiRequest(`/api/db/doc/${op.storageKey}/batch-delete`, {
+      method: "POST",
+      body: JSON.stringify({ ids: op.ids }),
+    });
+  }
+}
+
+export async function flushSyncOutbox(): Promise<boolean> {
+  if (outboxFlushInProgress || syncOutbox.length === 0) return true;
+  if (activeProvider !== "supabase") {
+    return false;
+  }
+
+  outboxFlushInProgress = true;
+  try {
+    while (syncOutbox.length > 0) {
+      const nextOp = syncOutbox[0];
+      try {
+        await executeOutboxOp(nextOp);
+        syncOutbox.shift();
+        persistOutbox();
+        currentSyncStatus = {
+          ...currentSyncStatus,
+          lastSavedAt: Date.now(),
+          lastError: null,
+          quotaExceeded: false,
+        };
+        notifySyncStatus();
+      } catch (err: any) {
+        console.warn("Gagal mengirim antrean sinkronisasi, akan dicoba ulang otomatis:", err?.message || err);
+        scheduleOutboxFlush(3000);
+        return false;
+      }
+    }
+    return true;
+  } finally {
+    outboxFlushInProgress = false;
+  }
+}
+
+if (syncOutbox.length > 0) {
+  currentSyncStatus = {
+    ...currentSyncStatus,
+    outboxCount: syncOutbox.length,
+    pendingCount: syncOutbox.length,
+  };
+}
+
+async function apiRequest<T = any>(
+  url: string,
+  options?: RequestInit & { timeoutMs?: number }
+): Promise<T> {
+  const controller = new AbortController();
+  const timeoutMs = options?.timeoutMs ?? 25000;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const bodyStr = typeof options?.body === "string" ? options.body : "";
+    const canKeepAlive = Boolean(options?.keepalive && bodyStr.length > 0 && bodyStr.length < 60000);
+    const { timeoutMs: _t, ...fetchOpts } = options || {};
     const res = await fetch(url, {
-      ...options,
+      ...fetchOpts,
+      keepalive: canKeepAlive,
+      cache: "no-store",
       headers: {
         "Content-Type": "application/json",
         ...(options?.headers || {}),
@@ -483,33 +806,138 @@ function mergeIncomingCollection(storageKey: string, remoteItems: any[]) {
     }
   });
 
-  const prevSerialized = localStorage.getItem(`exambro_${storageKey}`);
+  const prevSerialized = memoryCache.has(storageKey) ? JSON.stringify(memoryCache.get(storageKey)) : null;
   const nextSerialized = JSON.stringify(merged);
   if (prevSerialized !== nextSerialized) {
-    localStorage.setItem(`exambro_${storageKey}`, nextSerialized);
+    storage.set(storageKey, merged, false);
     return true;
   }
   return false;
 }
 
 let pollInProgress = false;
+let knownBootstrapVersions: Record<string, string> = {};
+let lastBootstrapScope = "";
+let consecutivePollFailures = 0;
+let lastSuccessfulSyncAt = 0;
+let hasCompletedInitialBootstrap = false;
 
-async function fetchSupabaseBootstrap(initial = false) {
+export async function fetchSoalForMapel(mapelId: string): Promise<Soal[]> {
+  const targetId = String(mapelId || "").trim();
+  if (!targetId) return [];
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await apiRequest<{ ok: boolean; items: Soal[] }>(
+        `/api/db/soal-by-mapel/${encodeURIComponent(targetId)}`,
+        { timeoutMs: 30000 }
+      );
+      const items = Array.isArray(res.items) ? res.items : [];
+      hasLiveSupabaseSoal = true;
+      const existing = storage.get<Soal[]>("soal", []);
+      const others = (Array.isArray(existing) ? existing : []).filter(
+        (s) => String(s?.mapelId || "").trim() !== targetId
+      );
+      storage.set("soal", [...others, ...items]);
+      return items;
+    } catch (err) {
+      console.warn(`Percobaan ${attempt + 1} gagal memuat soal mapel dari server:`, err);
+      if (attempt < 2) {
+        await new Promise((r) => setTimeout(r, 900 * (attempt + 1)));
+      }
+    }
+  }
+
+  const cachedIdb = await idbRead<Soal[]>("soal");
+  if (Array.isArray(cachedIdb) && cachedIdb.length > 0) {
+    const matched = cachedIdb.filter((s) => String(s?.mapelId || "").trim() === targetId);
+    if (matched.length > 0) {
+      if (!memoryCache.has("soal")) {
+        memoryCache.set("soal", cachedIdb);
+      }
+      return matched;
+    }
+  }
+
+  return getDB.soal().filter((s) => String(s?.mapelId || "").trim() === targetId);
+}
+
+export async function fetchStudentSession(nisn: string): Promise<SesiSiswa | null> {
+  const target = String(nisn || "").trim();
+  if (!target) return null;
+  if (activeProvider === "supabase") {
+    try {
+      const res = await apiRequest<{ ok: boolean; item: SesiSiswa | null }>(
+        `/api/db/doc/sessions/${encodeURIComponent(target)}`
+      );
+      const remoteSes = res.item;
+      const currentSessions = storage.get<SesiSiswa[]>("sessions", []);
+      if (remoteSes && !recentlyDeletedDocIds.has(target)) {
+        const next = [...currentSessions.filter((s) => s.id !== target), remoteSes];
+        storage.set("sessions", next);
+        return remoteSes;
+      }
+      if (!remoteSes) {
+        const next = currentSessions.filter((s) => s.id !== target);
+        if (next.length !== currentSessions.length) {
+          storage.set("sessions", next);
+        }
+        return null;
+      }
+    } catch (err) {
+      console.warn("Gagal memuat sesi siswa:", err);
+    }
+  }
+  return getDB.sessions().find((s) => s.id === target) || null;
+}
+
+async function fetchSupabaseBootstrap(initial = false, forceRefresh = false) {
   if (activeProvider !== "supabase" || pollInProgress) return;
-  if (!initial && typeof document !== "undefined" && document.visibilityState === "hidden") return;
+  if (!initial && !forceRefresh && typeof document !== "undefined" && document.visibilityState === "hidden") return;
 
   pollInProgress = true;
   try {
+    if (syncOutbox.length > 0) {
+      await flushSyncOutbox();
+    }
+
     if (syncMode === "student" && activeStudentNisn) {
-      const res = await apiRequest<{ ok: boolean; data: { jadwal: any[]; tokens: any[]; mySession: any | null } }>(
-        `/api/db/bootstrap?scope=student&nisn=${encodeURIComponent(activeStudentNisn)}`
-      );
+      const forceParam = forceRefresh ? "&force=1" : "";
+      const res = await apiRequest<{
+        ok: boolean;
+        data: { jadwal: any[]; tokens: any[]; mySession: any | null; myHasil?: any[] };
+      }>(`/api/db/bootstrap?scope=student&nisn=${encodeURIComponent(activeStudentNisn)}${forceParam}`);
       let changed = false;
       if (Array.isArray(res.data?.jadwal)) {
         if (mergeIncomingCollection("jadwal", res.data.jadwal)) changed = true;
       }
       if (Array.isArray(res.data?.tokens)) {
         if (mergeIncomingCollection("tokens", res.data.tokens)) changed = true;
+      }
+      if (Array.isArray(res.data?.myHasil)) {
+        const remoteHasil = res.data.myHasil.filter((h: any) => h && h.id && !recentlyDeletedDocIds.has(h.id));
+        const currentHasil = storage.get<HasilUjian[]>("hasil", []);
+        const otherHasil = currentHasil.filter(
+          (h) => String(h?.siswaNisn || "").trim() !== activeStudentNisn
+        );
+        const protectedLocalMine = currentHasil.filter(
+          (h) =>
+            String(h?.siswaNisn || "").trim() === activeStudentNisn &&
+            isDocWriteProtected("hasil", h.id) &&
+            !remoteHasil.some((r: any) => r.id === h.id)
+        );
+        const mergedMine = remoteHasil.map((r: any) => {
+          if (isDocWriteProtected("hasil", r.id)) {
+            const localMatch = currentHasil.find((l) => l.id === r.id);
+            if (localMatch) return localMatch;
+          }
+          return r;
+        });
+        const nextHasil = [...otherHasil, ...mergedMine, ...protectedLocalMine];
+        if (stableStringify(currentHasil) !== stableStringify(nextHasil)) {
+          storage.set("hasil", nextHasil, false);
+          changed = true;
+        }
       }
       // Update only this student's session so admin/proctor force-submit or reset takes effect immediately
       const currentSessions = storage.get<SesiSiswa[]>("sessions", []);
@@ -519,26 +947,56 @@ async function fetchSupabaseBootstrap(initial = false) {
           const withoutMe = currentSessions.filter((s) => s.id !== activeStudentNisn);
           const next = [...withoutMe, remoteSes];
           if (stableStringify(currentSessions) !== stableStringify(next)) {
-            localStorage.setItem("exambro_sessions", JSON.stringify(next));
+            storage.set("sessions", next, false);
             changed = true;
           }
         } else {
           // Session was deleted (Reset Sesi by proctor/admin)
           const withoutMe = currentSessions.filter((s) => s.id !== activeStudentNisn);
           if (withoutMe.length !== currentSessions.length) {
-            localStorage.setItem("exambro_sessions", JSON.stringify(withoutMe));
+            storage.set("sessions", withoutMe, false);
             changed = true;
           }
         }
       }
-      if (changed) notifySync();
+      consecutivePollFailures = 0;
+      hasCompletedInitialBootstrap = true;
+      lastSuccessfulSyncAt = Date.now();
+      if (!currentSyncStatus.cloudReady || currentSyncStatus.lastError || currentSyncStatus.lastSyncedAt !== lastSuccessfulSyncAt) {
+        currentSyncStatus = {
+          ...currentSyncStatus,
+          cloudReady: true,
+          lastError: null,
+          lastSyncedAt: lastSuccessfulSyncAt,
+          quotaExceeded: false,
+          provider: "supabase",
+        };
+        notifySyncStatus();
+      }
+      if (changed || initial) notifySync();
     } else {
       const isStudentPage =
         typeof window !== "undefined" && window.location.search.toLowerCase().includes("siswa");
       const scope = isStudentPage ? "studentInit" : "staff";
-      const res = await apiRequest<{ ok: boolean; data: Record<string, any> }>(
-        `/api/db/bootstrap?scope=${scope}`
-      );
+      if (lastBootstrapScope !== scope || forceRefresh) {
+        knownBootstrapVersions = {};
+        lastBootstrapScope = scope;
+      }
+      const versionsQuery =
+        !initial && !forceRefresh && Object.keys(knownBootstrapVersions).length > 0
+          ? `&versions=${encodeURIComponent(JSON.stringify(knownBootstrapVersions))}`
+          : "";
+      const forceQuery = forceRefresh ? "&force=1" : "";
+      const res = await apiRequest<{
+        ok: boolean;
+        data: Record<string, any>;
+        versions?: Record<string, string>;
+      }>(`/api/db/bootstrap?scope=${scope}${versionsQuery}${forceQuery}`, {
+        timeoutMs: initial || forceRefresh ? 45000 : 25000,
+      });
+      if (res.versions && typeof res.versions === "object") {
+        knownBootstrapVersions = { ...knownBootstrapVersions, ...res.versions };
+      }
       const data = res.data || {};
       let changed = false;
 
@@ -559,39 +1017,56 @@ async function fetchSupabaseBootstrap(initial = false) {
 
       for (const k of arrayKeys) {
         if (Array.isArray(data[k])) {
+          if (k === "soal") hasLiveSupabaseSoal = true;
           if (mergeIncomingCollection(k, data[k])) changed = true;
         }
       }
 
       if (data.konfig && !isDocWriteProtected("konfig", "sekolah")) {
-        const prevK = localStorage.getItem("exambro_konfig");
+        const prevK = memoryCache.has("konfig") ? JSON.stringify(memoryCache.get("konfig")) : null;
         const nextK = JSON.stringify(data.konfig);
         if (prevK !== nextK) {
-          localStorage.setItem("exambro_konfig", nextK);
+          storage.set("konfig", data.konfig, false);
           changed = true;
         }
       }
 
-      if (!currentSyncStatus.cloudReady || currentSyncStatus.lastError) {
-        currentSyncStatus = {
-          ...currentSyncStatus,
-          cloudReady: true,
-          lastError: null,
-          quotaExceeded: false,
-          provider: "supabase",
-        };
-        notifySyncStatus();
-      }
+      consecutivePollFailures = 0;
+      hasCompletedInitialBootstrap = true;
+      lastSuccessfulSyncAt = Date.now();
+      currentSyncStatus = {
+        ...currentSyncStatus,
+        cloudReady: true,
+        lastError: null,
+        lastSyncedAt: lastSuccessfulSyncAt,
+        quotaExceeded: false,
+        provider: "supabase",
+      };
+      notifySyncStatus();
 
       if (changed || initial) notifySync();
     }
   } catch (err: any) {
+    consecutivePollFailures += 1;
     console.warn("Sinkronisasi Supabase sementara tertunda:", err?.message || err);
-    if (initial) {
+    if (!hasCompletedInitialBootstrap) {
+      currentSyncStatus = {
+        ...currentSyncStatus,
+        cloudReady: false,
+        lastError: `Memuat database dari server (${err?.message || "menghubungkan ulang"})...`,
+        provider: "supabase",
+      };
+      notifySyncStatus();
+      setTimeout(() => {
+        if (!hasCompletedInitialBootstrap && activeProvider === "supabase") {
+          void fetchSupabaseBootstrap(true, false);
+        }
+      }, 2000);
+    } else if (consecutivePollFailures >= 2) {
       currentSyncStatus = {
         ...currentSyncStatus,
         cloudReady: true,
-        lastError: `Gagal memuat data awal Supabase: ${err?.message || err}`,
+        lastError: `Koneksi ke server sempat terputus (${err?.message || "timeout"}). Mencoba sinkronisasi ulang otomatis...`,
         provider: "supabase",
       };
       notifySyncStatus();
@@ -601,164 +1076,186 @@ async function fetchSupabaseBootstrap(initial = false) {
   }
 }
 
-async function syncArrayToBackend(storageKey: string, newItems: any[], prevItems?: any[]) {
+export async function forceSyncNow(bypassServerCache = true): Promise<boolean> {
+  if (typeof window === "undefined") return false;
   if (activeProvider !== "supabase") {
-    if (activeProvider === "firestore-readonly" || activeProvider === "unconfigured") {
-      currentSyncStatus = {
-        ...currentSyncStatus,
-        lastError:
-          "Database Supabase belum terhubung. Tambahkan SUPABASE_URL dan SUPABASE_SERVICE_ROLE_KEY di panel Secrets AI Studio, lalu restart aplikasi.",
-        quotaExceeded: false,
-      };
-      notifySyncStatus();
+    await probeAndActivateSupabase(0);
+  }
+  if (activeProvider !== "supabase") return false;
+  await flushSyncOutbox();
+  await fetchSupabaseBootstrap(!hasCompletedInitialBootstrap, bypassServerCache);
+  return hasCompletedInitialBootstrap && consecutivePollFailures === 0;
+}
+
+function beginWriteTracking() {
+  activeWriteCount += 1;
+  currentSyncStatus = {
+    ...currentSyncStatus,
+    pendingCount: activeWriteCount + syncOutbox.length,
+    outboxCount: syncOutbox.length,
+    lastError: null,
+  };
+  notifySyncStatus();
+}
+
+function endWriteTracking(saved: boolean, errMsg?: string) {
+  activeWriteCount = Math.max(0, activeWriteCount - 1);
+  currentSyncStatus = {
+    ...currentSyncStatus,
+    pendingCount: activeWriteCount + syncOutbox.length,
+    outboxCount: syncOutbox.length,
+    lastSavedAt: saved ? Date.now() : currentSyncStatus.lastSavedAt,
+    lastError: errMsg ?? (saved ? null : currentSyncStatus.lastError),
+    quotaExceeded: false,
+  };
+  notifySyncStatus();
+}
+
+async function syncArrayToBackend(storageKey: string, newItems: any[], prevItems?: any[]) {
+  const cleanedItems = (newItems || [])
+    .map((item) => cleanPayload(item))
+    .filter((i: any) => Boolean(i && i.id));
+  const incomingMap = new Map(cleanedItems.map((item) => [item.id, item]));
+
+  const oldItems = (prevItems ?? storage.get<any[]>(storageKey, [])).map((item) => cleanPayload(item));
+  const oldMap = new Map(
+    oldItems.filter((i: any) => Boolean(i && i.id)).map((item: any) => [item.id, item])
+  );
+
+  const oldDeletedIds = oldItems
+    .filter((item: any) => item && item.id && !incomingMap.has(item.id))
+    .map((item: any) => item.id);
+
+  oldDeletedIds.forEach((id: string) => markDocAsDeleted(id));
+
+  const changedItems = cleanedItems.filter((item: any) => {
+    const prevDoc = oldMap.get(item.id);
+    if (!prevDoc) return true;
+    return stableStringify(prevDoc) !== stableStringify(item);
+  });
+
+  const itemsToWrite = oldItems.length === 0 && changedItems.length === 0 ? cleanedItems : changedItems;
+
+  if (cleanedItems.length > 0 && oldDeletedIds.length === 0 && itemsToWrite.length === 0) {
+    return;
+  }
+
+  if (activeProvider !== "supabase") {
+    if (cleanedItems.length === 0) {
+      enqueueOutboxOp({ kind: "collection-delete", storageKey, queuedAt: Date.now() });
+    } else {
+      enqueueOutboxOp({
+        kind: "collection-put",
+        storageKey,
+        upserts: itemsToWrite,
+        deleteIds: oldDeletedIds,
+        queuedAt: Date.now(),
+      });
     }
     return;
   }
 
-  currentSyncStatus = {
-    ...currentSyncStatus,
-    pendingCount: currentSyncStatus.pendingCount + 1,
-    lastError: null,
-  };
-  notifySyncStatus();
-
+  beginWriteTracking();
   try {
-    const cleanedItems = (newItems || [])
-      .map((item) => cleanPayload(item))
-      .filter((i: any) => Boolean(i && i.id));
-    const incomingMap = new Map(cleanedItems.map((item) => [item.id, item]));
-
-    const oldItems = (prevItems ?? storage.get<any[]>(storageKey, [])).map((item) => cleanPayload(item));
-    const oldMap = new Map(
-      oldItems.filter((i: any) => Boolean(i && i.id)).map((item: any) => [item.id, item])
-    );
-
-    const oldDeletedIds = oldItems
-      .filter((item: any) => item && item.id && !incomingMap.has(item.id))
-      .map((item: any) => item.id);
-
-    oldDeletedIds.forEach((id: string) => markDocAsDeleted(id));
-
     if (cleanedItems.length === 0) {
       await apiRequest(`/api/db/collection/${storageKey}`, { method: "DELETE" });
-      currentSyncStatus = {
-        ...currentSyncStatus,
-        pendingCount: Math.max(0, currentSyncStatus.pendingCount - 1),
-        lastSavedAt: Date.now(),
-        lastError: null,
-        quotaExceeded: false,
-      };
-      notifySyncStatus();
-      return;
+    } else {
+      itemsToWrite.forEach((item: any) => markDocWriteInFlight(storageKey, item.id));
+      try {
+        await apiRequest(`/api/db/collection/${storageKey}`, {
+          method: "PUT",
+          body: JSON.stringify({
+            upserts: itemsToWrite,
+            deleteIds: oldDeletedIds,
+          }),
+        });
+      } finally {
+        itemsToWrite.forEach((item: any) => clearDocWriteInFlight(storageKey, item.id));
+      }
     }
-
-    const changedItems = cleanedItems.filter((item: any) => {
-      const prevDoc = oldMap.get(item.id);
-      if (!prevDoc) return true;
-      return stableStringify(prevDoc) !== stableStringify(item);
-    });
-
-    const itemsToWrite = oldItems.length === 0 && changedItems.length === 0 ? cleanedItems : changedItems;
-
-    if (oldDeletedIds.length === 0 && itemsToWrite.length === 0) {
-      currentSyncStatus = {
-        ...currentSyncStatus,
-        pendingCount: Math.max(0, currentSyncStatus.pendingCount - 1),
-        lastSavedAt: Date.now(),
-        lastError: null,
-      };
-      notifySyncStatus();
-      return;
-    }
-
-    itemsToWrite.forEach((item: any) => markDocWriteInFlight(storageKey, item.id));
-    try {
-      await apiRequest(`/api/db/collection/${storageKey}`, {
-        method: "PUT",
-        body: JSON.stringify({
-          upserts: itemsToWrite,
-          deleteIds: oldDeletedIds,
-        }),
-      });
-    } finally {
-      itemsToWrite.forEach((item: any) => clearDocWriteInFlight(storageKey, item.id));
-    }
-
-    currentSyncStatus = {
-      ...currentSyncStatus,
-      pendingCount: Math.max(0, currentSyncStatus.pendingCount - 1),
-      lastSavedAt: Date.now(),
-      lastError: null,
-      quotaExceeded: false,
-    };
-    notifySyncStatus();
+    endWriteTracking(true);
   } catch (err: any) {
-    console.warn(`Gagal menyimpan '${storageKey}' ke Supabase:`, err?.message || err);
-    currentSyncStatus = {
-      ...currentSyncStatus,
-      pendingCount: Math.max(0, currentSyncStatus.pendingCount - 1),
-      lastError: `Gagal menyimpan ke server Supabase (${storageKey}): ${err?.message || err}`,
-      quotaExceeded: false,
-    };
-    notifySyncStatus();
+    console.warn(`Gagal menyimpan '${storageKey}' ke Supabase, masuk antrean retry:`, err?.message || err);
+    if (cleanedItems.length === 0) {
+      enqueueOutboxOp({ kind: "collection-delete", storageKey, queuedAt: Date.now() });
+    } else {
+      enqueueOutboxOp({
+        kind: "collection-put",
+        storageKey,
+        upserts: itemsToWrite,
+        deleteIds: oldDeletedIds,
+        queuedAt: Date.now(),
+      });
+    }
+    endWriteTracking(false, `Koneksi lambat/terputus saat menyimpan (${storageKey}). Data tersimpan lokal & otomatis dikirim ulang.`);
   }
 }
 
-async function syncSingleDocToBackend(storageKey: string, docId: string, data: any) {
+async function syncSingleDocToBackend(storageKey: string, docId: string, data: any, keepalive = false) {
+  const cleaned = cleanPayload(data);
   if (activeProvider !== "supabase") {
-    currentSyncStatus = {
-      ...currentSyncStatus,
-      lastError:
-        "Database Supabase belum terhubung. Tambahkan SUPABASE_URL dan SUPABASE_SERVICE_ROLE_KEY di panel Secrets AI Studio.",
-      quotaExceeded: false,
-    };
-    notifySyncStatus();
+    enqueueOutboxOp({ kind: "doc-put", storageKey, docId, data: cleaned, queuedAt: Date.now() });
     return;
   }
 
-  currentSyncStatus = {
-    ...currentSyncStatus,
-    pendingCount: currentSyncStatus.pendingCount + 1,
-    lastError: null,
-  };
-  notifySyncStatus();
+  beginWriteTracking();
   markDocWriteInFlight(storageKey, docId);
 
   try {
     await apiRequest(`/api/db/doc/${storageKey}/${encodeURIComponent(docId)}`, {
       method: "PUT",
-      body: JSON.stringify({ item: cleanPayload(data) }),
+      keepalive,
+      body: JSON.stringify({ item: cleaned }),
     });
-    currentSyncStatus = {
-      ...currentSyncStatus,
-      pendingCount: Math.max(0, currentSyncStatus.pendingCount - 1),
-      lastSavedAt: Date.now(),
-      lastError: null,
-      quotaExceeded: false,
-    };
-    notifySyncStatus();
+    endWriteTracking(true);
   } catch (err: any) {
-    console.warn(`Gagal menyimpan dokumen ${storageKey}/${docId} ke Supabase:`, err?.message || err);
-    currentSyncStatus = {
-      ...currentSyncStatus,
-      pendingCount: Math.max(0, currentSyncStatus.pendingCount - 1),
-      lastError: `Gagal menyimpan ke server Supabase (${storageKey}): ${err?.message || err}`,
-      quotaExceeded: false,
-    };
-    notifySyncStatus();
+    console.warn(`Gagal menyimpan dokumen ${storageKey}/${docId}, masuk antrean retry:`, err?.message || err);
+    enqueueOutboxOp({ kind: "doc-put", storageKey, docId, data: cleaned, queuedAt: Date.now() });
+    endWriteTracking(false, `Koneksi sempat terputus (${storageKey}). Perubahan disimpan lokal & otomatis disinkronkan ulang.`);
   } finally {
     clearDocWriteInFlight(storageKey, docId);
   }
 }
 
 // Atomic student session upsert: updates localStorage + single row sessions/{nisn} without colliding with other 349 students
-export async function syncSingleSession(session: SesiSiswa): Promise<void> {
+export async function syncSingleSession(session: SesiSiswa, keepalive = false): Promise<void> {
   if (!session || !session.id) return;
   const cleaned = cleanPayload(session);
   const current = storage.get<SesiSiswa[]>("sessions", []);
   const next = [...current.filter((s) => s.id !== cleaned.id), cleaned];
   storage.set("sessions", next);
-  await syncSingleDocToBackend("sessions", cleaned.id, cleaned);
+  await syncSingleDocToBackend("sessions", cleaned.id, cleaned, keepalive);
+}
+
+// Atomic student result upsert: prevents overwriting/losing other students' results and retries automatically on Wi-Fi hiccups
+export async function syncSingleHasil(hasil: HasilUjian, oldIdsToDelete: string[] = []): Promise<void> {
+  if (!hasil || !hasil.id) return;
+  const cleaned = cleanPayload(hasil);
+  const deleteIds = oldIdsToDelete.filter((id) => id && id !== cleaned.id);
+  deleteIds.forEach((id) => markDocAsDeleted(id));
+
+  const current = storage.get<HasilUjian[]>("hasil", []);
+  const next = [
+    ...current.filter((h) => h.id !== cleaned.id && !deleteIds.includes(h.id)),
+    cleaned,
+  ];
+  storage.set("hasil", next);
+
+  await syncSingleDocToBackend("hasil", cleaned.id, cleaned, true);
+  if (deleteIds.length > 0) {
+    if (activeProvider === "supabase") {
+      try {
+        await apiRequest(`/api/db/doc/hasil/batch-delete`, {
+          method: "POST",
+          body: JSON.stringify({ ids: deleteIds }),
+        });
+      } catch {
+        enqueueOutboxOp({ kind: "batch-delete", storageKey: "hasil", ids: deleteIds, queuedAt: Date.now() });
+      }
+    } else {
+      enqueueOutboxOp({ kind: "batch-delete", storageKey: "hasil", ids: deleteIds, queuedAt: Date.now() });
+    }
+  }
 }
 
 async function deleteSingleDocFromBackend(storageKey: string, id: string): Promise<boolean> {
@@ -767,43 +1264,21 @@ async function deleteSingleDocFromBackend(storageKey: string, id: string): Promi
   storage.set(storageKey, filtered);
 
   if (activeProvider !== "supabase") {
-    currentSyncStatus = {
-      ...currentSyncStatus,
-      lastError:
-        "Database Supabase belum terhubung. Tambahkan SUPABASE_URL dan SUPABASE_SERVICE_ROLE_KEY di panel Secrets AI Studio.",
-    };
-    notifySyncStatus();
+    enqueueOutboxOp({ kind: "doc-delete", storageKey, docId: id, queuedAt: Date.now() });
     return false;
   }
 
-  currentSyncStatus = {
-    ...currentSyncStatus,
-    pendingCount: currentSyncStatus.pendingCount + 1,
-    lastError: null,
-  };
-  notifySyncStatus();
-
+  beginWriteTracking();
   try {
     await apiRequest(`/api/db/doc/${storageKey}/${encodeURIComponent(id)}`, {
       method: "DELETE",
     });
-    currentSyncStatus = {
-      ...currentSyncStatus,
-      pendingCount: Math.max(0, currentSyncStatus.pendingCount - 1),
-      lastSavedAt: Date.now(),
-      lastError: null,
-      quotaExceeded: false,
-    };
-    notifySyncStatus();
+    endWriteTracking(true);
     return true;
   } catch (err: any) {
-    console.warn(`Gagal menghapus ${storageKey}/${id} di Supabase:`, err?.message || err);
-    currentSyncStatus = {
-      ...currentSyncStatus,
-      pendingCount: Math.max(0, currentSyncStatus.pendingCount - 1),
-      lastError: `Gagal menghapus di server Supabase (${storageKey}): ${err?.message || err}`,
-    };
-    notifySyncStatus();
+    console.warn(`Gagal menghapus ${storageKey}/${id}, masuk antrean retry:`, err?.message || err);
+    enqueueOutboxOp({ kind: "doc-delete", storageKey, docId: id, queuedAt: Date.now() });
+    endWriteTracking(false, `Penghapusan (${storageKey}) tertunda karena koneksi, akan dicoba ulang otomatis.`);
     return false;
   }
 }
@@ -814,41 +1289,19 @@ async function deleteAllDocsFromBackend(storageKey: string): Promise<boolean> {
   storage.set(storageKey, []);
 
   if (activeProvider !== "supabase") {
-    currentSyncStatus = {
-      ...currentSyncStatus,
-      lastError:
-        "Database Supabase belum terhubung. Tambahkan SUPABASE_URL dan SUPABASE_SERVICE_ROLE_KEY di panel Secrets AI Studio.",
-    };
-    notifySyncStatus();
+    enqueueOutboxOp({ kind: "collection-delete", storageKey, queuedAt: Date.now() });
     return false;
   }
 
-  currentSyncStatus = {
-    ...currentSyncStatus,
-    pendingCount: currentSyncStatus.pendingCount + 1,
-    lastError: null,
-  };
-  notifySyncStatus();
-
+  beginWriteTracking();
   try {
     await apiRequest(`/api/db/collection/${storageKey}`, { method: "DELETE" });
-    currentSyncStatus = {
-      ...currentSyncStatus,
-      pendingCount: Math.max(0, currentSyncStatus.pendingCount - 1),
-      lastSavedAt: Date.now(),
-      lastError: null,
-      quotaExceeded: false,
-    };
-    notifySyncStatus();
+    endWriteTracking(true);
     return true;
   } catch (err: any) {
-    console.warn(`Gagal mengosongkan ${storageKey} di Supabase:`, err?.message || err);
-    currentSyncStatus = {
-      ...currentSyncStatus,
-      pendingCount: Math.max(0, currentSyncStatus.pendingCount - 1),
-      lastError: `Gagal menghapus data di server Supabase (${storageKey}): ${err?.message || err}`,
-    };
-    notifySyncStatus();
+    console.warn(`Gagal mengosongkan ${storageKey}, masuk antrean retry:`, err?.message || err);
+    enqueueOutboxOp({ kind: "collection-delete", storageKey, queuedAt: Date.now() });
+    endWriteTracking(false, `Gagal menghapus data di server (${storageKey}), akan dicoba ulang otomatis.`);
     return false;
   }
 }
@@ -927,7 +1380,11 @@ function startFirestoreReadFallback(reasonMessage: string) {
               items.push({ id: docSnap.id, ...docSnap.data() });
             }
           });
-          localStorage.setItem(`exambro_${key}`, JSON.stringify(items));
+          // Never wipe cached data if Firestore collection is empty
+          const existingLocal = storage.get<any[]>(key, []);
+          if (items.length > 0 || existingLocal.length === 0) {
+            storage.set(key, items, false);
+          }
           markLoaded(key);
           notifySync();
         },
@@ -942,8 +1399,7 @@ function startFirestoreReadFallback(reasonMessage: string) {
       (snapshot) => {
         if (activeProvider === "supabase") return;
         if (snapshot.exists()) {
-          localStorage.setItem("exambro_konfig", JSON.stringify(snapshot.data()));
-          notifySync();
+          storage.set("konfig", snapshot.data());
         }
       },
       () => {}
@@ -956,14 +1412,25 @@ function startFirestoreReadFallback(reasonMessage: string) {
 }
 
 let supabasePollStarted = false;
+let probeInProgress = false;
+let probeRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
 async function probeAndActivateSupabase(retryCount = 0): Promise<void> {
-  if (typeof window === "undefined") return;
+  if (typeof window === "undefined" || probeInProgress) return;
+  probeInProgress = true;
   try {
-    const res = await fetch("/api/db/health", { cache: "no-store" });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+    let res: Response;
+    try {
+      res = await fetch("/api/db/health", { cache: "no-store", signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+
     const contentType = res.headers.get("content-type") || "";
     if (!contentType.includes("application/json")) {
-      throw new Error("Endpoint backend /api/db/health mengembalikan HTML (server backend Express belum aktif atau perlu publish ulang).");
+      throw new Error("Server sedang bersiap (cold start). Menghubungkan ulang otomatis...");
     }
     const health = (await res.json()) as {
       provider?: string;
@@ -974,6 +1441,7 @@ async function probeAndActivateSupabase(retryCount = 0): Promise<void> {
 
     if (health.provider === "supabase" && health.configured && health.ok) {
       activeProvider = "supabase";
+      knownBootstrapVersions = {};
       currentSyncStatus = {
         ...currentSyncStatus,
         provider: "supabase",
@@ -982,14 +1450,15 @@ async function probeAndActivateSupabase(retryCount = 0): Promise<void> {
       };
       notifySyncStatus();
 
-      await fetchSupabaseBootstrap(true);
+      await flushSyncOutbox();
+      await fetchSupabaseBootstrap(true, false);
 
       if (!supabasePollStarted) {
         supabasePollStarted = true;
         const scheduleNextPoll = () => {
-          const delayMs = syncMode === "student" ? 10000 : 5000;
+          const delayMs = syncMode === "student" ? 12000 : 10000;
           setTimeout(async () => {
-            await fetchSupabaseBootstrap(false);
+            await fetchSupabaseBootstrap(false, false);
             scheduleNextPoll();
           }, delayMs);
         };
@@ -998,23 +1467,59 @@ async function probeAndActivateSupabase(retryCount = 0): Promise<void> {
       return;
     }
 
-    startFirestoreReadFallback(
-      health.message ||
-        "Database Supabase belum aktif: tambahkan SUPABASE_URL dan SUPABASE_SERVICE_ROLE_KEY di panel Secrets AI Studio, lalu restart aplikasi."
-    );
-  } catch (err: any) {
-    startFirestoreReadFallback(
-      err?.message ||
-        "Server backend belum merespons untuk Supabase. Mode baca Firestore sementara aktif untuk Backup JSON."
-    );
-    if (retryCount < 12) {
-      setTimeout(() => {
-        if (activeProvider !== "supabase") {
-          probeAndActivateSupabase(retryCount + 1);
-        }
-      }, 4000);
+    // Only switch to Firestore read-only fallback if Supabase env vars are genuinely unconfigured
+    if (health.configured === false) {
+      startFirestoreReadFallback(
+        health.message ||
+          "Database Supabase belum aktif: tambahkan SUPABASE_URL dan SUPABASE_SERVICE_ROLE_KEY di panel Secrets AI Studio, lalu restart aplikasi."
+      );
+      return;
     }
+
+    throw new Error(health.message || "Koneksi Supabase sedang dipulihkan...");
+  } catch (err: any) {
+    console.warn("Probe Supabase tertunda, mencoba ulang:", err?.message || err);
+    currentSyncStatus = {
+      ...currentSyncStatus,
+      lastError: err?.message || "Menghubungkan ke server database...",
+    };
+    notifySyncStatus();
+
+    if (!probeRetryTimer) {
+      const retryDelay = retryCount < 5 ? 1500 : retryCount < 15 ? 3000 : 6000;
+      probeRetryTimer = setTimeout(() => {
+        probeRetryTimer = null;
+        if (activeProvider !== "supabase") {
+          void probeAndActivateSupabase(retryCount + 1);
+        }
+      }, retryDelay);
+    }
+  } finally {
+    probeInProgress = false;
   }
+}
+
+if (typeof window !== "undefined") {
+  const triggerForegroundSync = () => {
+    const now = Date.now();
+    if (now - lastSuccessfulSyncAt < 1500) {
+      if (syncOutbox.length > 0 && activeProvider === "supabase") {
+        void flushSyncOutbox();
+      }
+      return;
+    }
+    void forceSyncNow(false);
+  };
+
+  window.addEventListener("online", () => {
+    void forceSyncNow(false);
+  });
+  window.addEventListener("focus", triggerForegroundSync);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      triggerForegroundSync();
+    }
+  });
 }
 
 probeAndActivateSupabase(0);
@@ -1174,42 +1679,79 @@ export const setDB = {
     storage.set("hasil", filtered);
 
     if (activeProvider !== "supabase") {
-      currentSyncStatus = {
-        ...currentSyncStatus,
-        lastError: "Database Supabase belum terhubung.",
-      };
-      notifySyncStatus();
+      enqueueOutboxOp({ kind: "batch-delete", storageKey: "hasil", ids, queuedAt: Date.now() });
       return false;
     }
 
-    currentSyncStatus = {
-      ...currentSyncStatus,
-      pendingCount: currentSyncStatus.pendingCount + 1,
-      lastError: null,
-    };
-    notifySyncStatus();
+    beginWriteTracking();
     try {
       await apiRequest(`/api/db/doc/hasil/batch-delete`, {
         method: "POST",
         body: JSON.stringify({ ids }),
       });
-      currentSyncStatus = {
-        ...currentSyncStatus,
-        pendingCount: Math.max(0, currentSyncStatus.pendingCount - 1),
-        lastSavedAt: Date.now(),
-        lastError: null,
-      };
-      notifySyncStatus();
+      endWriteTracking(true);
       return true;
     } catch (err: any) {
-      currentSyncStatus = {
-        ...currentSyncStatus,
-        pendingCount: Math.max(0, currentSyncStatus.pendingCount - 1),
-        lastError: `Gagal menghapus hasil di Supabase: ${err?.message || err}`,
-      };
-      notifySyncStatus();
+      enqueueOutboxOp({ kind: "batch-delete", storageKey: "hasil", ids, queuedAt: Date.now() });
+      endWriteTracking(false, `Penghapusan hasil tertunda karena koneksi, akan dicoba ulang otomatis.`);
       return false;
     }
   },
   deleteAllHasil: () => deleteAllDocsFromBackend("hasil"),
 };
+
+export async function restoreFullBackupToBackend(data: Record<string, any>): Promise<number> {
+  const keys = [
+    "kelas",
+    "kelasAkademik",
+    "mapel",
+    "siswa",
+    "guru",
+    "pengawas",
+    "jadwalNgawas",
+    "soal",
+    "jadwal",
+    "hasil",
+  ] as const;
+
+  let restoredCount = 0;
+  for (const key of keys) {
+    if (Array.isArray(data[key])) {
+      const cleaned = cleanPayload(data[key]).filter((item: any) => Boolean(item && item.id));
+      storage.set(key, cleaned);
+      restoredCount++;
+      if (activeProvider === "supabase") {
+        beginWriteTracking();
+        try {
+          await apiRequest(`/api/db/collection/${key}`, {
+            method: "PUT",
+            timeoutMs: 60000,
+            body: JSON.stringify({ items: cleaned }),
+          });
+          endWriteTracking(true);
+        } catch (err: any) {
+          enqueueOutboxOp({
+            kind: "collection-put",
+            storageKey: key,
+            upserts: cleaned,
+            deleteIds: [],
+            queuedAt: Date.now(),
+          });
+          endWriteTracking(
+            false,
+            `Sinkronisasi restore '${key}' tertunda (${err?.message || "koneksi"}), otomatis dicoba ulang.`
+          );
+        }
+      }
+    }
+  }
+
+  if (data.konfig && typeof data.konfig === "object") {
+    const cleanedKonfig = cleanPayload(data.konfig);
+    storage.set("konfig", cleanedKonfig);
+    await syncSingleDocToBackend("konfig", "sekolah", cleanedKonfig);
+    restoredCount++;
+  }
+
+  return restoredCount;
+}

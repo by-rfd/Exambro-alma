@@ -70,6 +70,25 @@ function stripBidiControls(str: string): string {
   return str.replace(/[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF\u061C]/g, "");
 }
 
+// Preserve balanced <u>...</u> if a prefix ("1." or "A.") was inside an underlined Word run
+function restoreUnderlineAcrossPrefix(hadLeadingOpenU: boolean, restText: string): string {
+  let res = (restText || "").trim();
+  // Remove leading orphan closing tag left when only the prefix was underlined (e.g. "<u>A.</u> teks")
+  if (hadLeadingOpenU && /^<\/u>/i.test(res)) {
+    res = res.replace(/^<\/u>\s*/i, "").trim();
+    return res;
+  }
+  if (hadLeadingOpenU && res) {
+    // Re-open <u> on the rest if a closing </u> exists before any new <u>
+    const firstOpen = res.indexOf("<u>");
+    const firstClose = res.indexOf("</u>");
+    if (firstClose !== -1 && (firstOpen === -1 || firstClose < firstOpen)) {
+      res = `<u>${res}`;
+    }
+  }
+  return res;
+}
+
 function normalizeDigits(str: string): string {
   return str.replace(/[٠-٩۰-۹]/g, (ch) => ARABIC_DIGIT_MAP[ch] ?? ch);
 }
@@ -87,7 +106,7 @@ export function extractImageTokens(text: string): { cleanText: string; images: s
 }
 
 function mapKeyTokenToLatin(raw: string): OpsiKey | null {
-  const cleaned = stripBidiControls(raw).trim();
+  const cleaned = stripBidiControls(raw).replace(/<\/?u>/gi, "").trim();
   if (!cleaned) return null;
   if (ARABIC_OPT_TO_LATIN[cleaned]) return ARABIC_OPT_TO_LATIN[cleaned];
   const upper = cleaned.toUpperCase();
@@ -105,7 +124,11 @@ interface OptionLineMatch {
 }
 
 function matchSingleOptionPrefix(rawLine: string): OptionLineMatch | null {
-  const line = stripBidiControls(rawLine).trimStart();
+  const rawTrimmed = stripBidiControls(rawLine).trimStart();
+  if (!rawTrimmed) return null;
+
+  const hadLeadingOpenU = /^<u>/i.test(rawTrimmed);
+  const line = hadLeadingOpenU ? rawTrimmed.replace(/^<u>\s*/i, "") : rawTrimmed;
   if (!line) return null;
 
   // Star/asterisk marking answer key: "*A. ...", "**A.** ...", "A*. ..."
@@ -113,7 +136,7 @@ function matchSingleOptionPrefix(rawLine: string): OptionLineMatch | null {
     /^\*{1,2}\s*\[?\(?([A-E])\)?\]?\s*[\.\)\-:]?\s*(.*)$/i
   ) || line.match(/^\(?([A-E])\)?\*\s*[\.\)\-:]\s*(.*)$/i);
   if (starLatin) {
-    const rest = starLatin[2].replace(/^\*{1,2}\s*/, "").trim();
+    const rest = restoreUnderlineAcrossPrefix(hadLeadingOpenU, starLatin[2].replace(/^\*{1,2}\s*/, ""));
     return { key: starLatin[1].toUpperCase() as OpsiKey, rest, isStarred: true };
   }
 
@@ -127,7 +150,7 @@ function matchSingleOptionPrefix(rawLine: string): OptionLineMatch | null {
   if (latinMatch) {
     return {
       key: latinMatch[1].toUpperCase() as OpsiKey,
-      rest: (latinMatch[2] || "").trim(),
+      rest: restoreUnderlineAcrossPrefix(hadLeadingOpenU, latinMatch[2] || ""),
       isStarred: false,
     };
   }
@@ -139,7 +162,11 @@ function matchSingleOptionPrefix(rawLine: string): OptionLineMatch | null {
   if (arabicStar) {
     const mapped = ARABIC_OPT_TO_LATIN[arabicStar[1]];
     if (mapped) {
-      return { key: mapped, rest: (arabicStar[2] || "").trim(), isStarred: true };
+      return {
+        key: mapped,
+        rest: restoreUnderlineAcrossPrefix(hadLeadingOpenU, arabicStar[2] || ""),
+        isStarred: true,
+      };
     }
   }
 
@@ -149,7 +176,11 @@ function matchSingleOptionPrefix(rawLine: string): OptionLineMatch | null {
   if (arabicMatch) {
     const mapped = ARABIC_OPT_TO_LATIN[arabicMatch[1]];
     if (mapped) {
-      return { key: mapped, rest: (arabicMatch[2] || "").trim(), isStarred: false };
+      return {
+        key: mapped,
+        rest: restoreUnderlineAcrossPrefix(hadLeadingOpenU, arabicMatch[2] || ""),
+        isStarred: false,
+      };
     }
   }
 
@@ -158,6 +189,11 @@ function matchSingleOptionPrefix(rawLine: string): OptionLineMatch | null {
 
 // Split a line that packs multiple options horizontally (e.g., "A. 10 cm   B. 20 cm   C. 30 cm" or Word table tabs)
 function splitInlineMultiOptions(line: string): string[] {
+  // Never split serialized HTML tables from Word
+  if (/<table\b/i.test(line)) {
+    return [line];
+  }
+
   const check = stripBidiControls(line);
   // Look for 2+ option markers separated by whitespace/tabs where at least B follows A, or D follows C, etc.
   const hasTabOptions = /\t\s*(?:\*?\s*)?(?:[\(\[]?[B-E][\)\]]?[\.\)\-:\t]|(?:أ|ب|ج|د|هـ)[\.\)\-:])/i.test(check);
@@ -194,7 +230,11 @@ function splitInlineMultiOptions(line: string): string[] {
 
 // Match question start ONLY at line beginning
 function matchQuestionStart(rawLine: string): { num: number | null; rest: string; isExplicitSeparator: boolean } | null {
-  const clean = stripBidiControls(rawLine).trimStart();
+  const rawClean = stripBidiControls(rawLine).trimStart();
+  if (!rawClean) return null;
+
+  const hadLeadingOpenU = /^<u>/i.test(rawClean);
+  const clean = hadLeadingOpenU ? rawClean.replace(/^<u>\s*/i, "") : rawClean;
   if (!clean) return null;
 
   // Explicit separators: === or --- or [Soal] or [Soal 1]
@@ -219,9 +259,10 @@ function matchQuestionStart(rawLine: string): { num: number | null; rest: string
       const origPrefixMatch = clean.match(
         /^(?:(?:Soal\s*(?:No\.?)?\s*|No\.?\s*|س\s*)?)[0-9٠-٩۰-۹]{1,3}\s*(?:[\.\)\:]|\.\-)\s*(.*)$/i
       );
+      const rawRest = origPrefixMatch ? origPrefixMatch[1].trim() : qMatch[2].trim();
       return {
         num,
-        rest: origPrefixMatch ? origPrefixMatch[1].trim() : qMatch[2].trim(),
+        rest: restoreUnderlineAcrossPrefix(hadLeadingOpenU, rawRest),
         isExplicitSeparator: false,
       };
     }
@@ -555,6 +596,8 @@ export function buildSoalObjectsFromParsed(
       opsi: { ...item.opsi },
       kunci: item.kunci,
       kelasIds: [...(params.kelasIds || [])],
+      createdAt: now,
+      urutan: idx,
     };
     if (params.guruId) soal.guruId = params.guruId;
     if (item.gambarUrl) soal.gambarUrl = item.gambarUrl;
@@ -563,4 +606,220 @@ export function buildSoalObjectsFromParsed(
     }
     return soal;
   });
+}
+
+// Convert Word / Google Docs HTML clipboard data into soal text preserving <table>...</table> and <u>...</u>
+export function convertWordClipboardHtmlToSoalText(html: string): string | null {
+  if (!html || typeof window === "undefined" || typeof DOMParser === "undefined") return null;
+  if (!/<(?:table|u|ins)\b|(?:text-decoration(?:-line)?|text-underline|mso-text-underline)\s*:/i.test(html)) {
+    return null;
+  }
+
+  const cleanedHtml = html
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<(style|script|xml|head|title|meta|link)\b[\s\S]*?<\/\1>/gi, "");
+
+  const doc = new DOMParser().parseFromString(cleanedHtml, "text/html");
+  if (!doc.body) return null;
+
+  const isUnderlinedElement = (el: Element): boolean => {
+    if (el.tagName === "U" || el.tagName === "INS") return true;
+    const styleAttr = (el.getAttribute("style") || "").toLowerCase();
+    if (/text-decoration(?:-line)?\s*:\s*[^;]*underline/.test(styleAttr)) return true;
+    if (/(?:mso-text-underline|text-underline)\s*:\s*[^;]*(?:single|double|thick|dotted|dash|wave)/.test(styleAttr)) return true;
+    return false;
+  };
+
+  const extractInline = (node: Node, inheritedUnderline = false): string => {
+    if (node.nodeType === 3) {
+      const txt = (node.nodeValue || "").replace(/[\r\n]+/g, " ");
+      if (!txt) return "";
+      if (inheritedUnderline) {
+        if (txt.trim().length > 0) return `<u>${txt}</u>`;
+        if (txt.length >= 2) return `<u>${"\u00A0".repeat(Math.min(12, txt.length))}</u>`;
+      }
+      return txt;
+    }
+    if (node.nodeType !== 1) return "";
+    const el = node as Element;
+    const tag = el.tagName;
+    if (tag === "STYLE" || tag === "SCRIPT" || tag === "XML" || tag === "DEL") return "";
+    if (tag === "BR") return "\n";
+    if (tag === "SUP") {
+      const inner = Array.from(el.childNodes).map((c) => extractInline(c, false)).join("").trim();
+      return inner ? `$^{${inner}}$` : "";
+    }
+    if (tag === "SUB") {
+      const inner = Array.from(el.childNodes).map((c) => extractInline(c, false)).join("").trim();
+      return inner ? `$_{${inner}}$` : "";
+    }
+    if (tag === "IMG") {
+      const src = (el.getAttribute("src") || "").trim();
+      if (/^(data:image\/|https?:\/\/)/i.test(src)) {
+        return ` [[IMG_TOKEN:${src}]] `;
+      }
+      return "";
+    }
+    const nextUnderline = inheritedUnderline || isUnderlinedElement(el);
+    return Array.from(el.childNodes).map((c) => extractInline(c, nextUnderline)).join("");
+  };
+
+  const normalizeInlineU = (raw: string): string =>
+    raw
+      .replace(/[ ]{2,}/g, " ")
+      .replace(/<\/u><u>/g, "")
+      .replace(/<u>([\s\S]*?)<\/u>/g, (_m, inner: string) => {
+        const lead = inner.match(/^([ \t\r\n]*)/)?.[1] || "";
+        const trail = inner.match(/([ \t\r\n]*)$/)?.[1] || "";
+        const core = inner.slice(lead.length, inner.length - trail.length);
+        if (!core) {
+          if (/\t/.test(inner) || inner.length >= 2) {
+            return `<u>${"\u00A0".repeat(Math.min(12, Math.max(4, inner.replace(/\t/g, "    ").length)))}</u>`;
+          }
+          return inner;
+        }
+        return `${lead}<u>${core}</u>${trail}`;
+      })
+      .trim();
+
+  const serializeClipboardTable = (tblEl: Element): string[] => {
+    const trEls = Array.from(tblEl.querySelectorAll(":scope > tr, :scope > thead > tr, :scope > tbody > tr"));
+    const rows: Array<Array<{ text: string; tag: "th" | "td"; colSpan: number; rowSpan: number; align: string }>> = [];
+
+    trEls.forEach((tr, rIdx) => {
+      const cells = Array.from(tr.children).filter((c) => c.tagName === "TH" || c.tagName === "TD");
+      if (cells.length === 0) return;
+      const rowData = cells.map((cell) => {
+        const pEls = Array.from(cell.children).filter((ch) => ch.tagName === "P" || ch.tagName === "DIV");
+        const rawText =
+          pEls.length > 0
+            ? pEls.map((p) => normalizeInlineU(extractInline(p, false))).filter(Boolean).join("\n")
+            : normalizeInlineU(extractInline(cell, false));
+        const colSpan = Math.max(1, parseInt(cell.getAttribute("colspan") || "1", 10) || 1);
+        const rowSpan = Math.max(1, parseInt(cell.getAttribute("rowspan") || "1", 10) || 1);
+        const align = (cell.getAttribute("align") || "").toLowerCase();
+        const isBoldHeader = rIdx === 0 && (cell.tagName === "TH" || cell.closest("thead") !== null);
+        return {
+          text: rawText,
+          tag: (isBoldHeader ? "th" : "td") as "th" | "td",
+          colSpan,
+          rowSpan,
+          align: align === "center" || align === "right" ? align : "left",
+        };
+      });
+      if (rowData.some((c) => c.text.length > 0)) {
+        rows.push(rowData);
+      }
+    });
+
+    if (rows.length === 0) return [];
+
+    // Unwrap if clipboard table is an exam layout table (option grid or [No | Soal+Opsi])
+    const flatCells = rows.flatMap((r) => r.map((c) => c.text.trim()).filter(Boolean));
+    const strictOptCount = flatCells.filter((t) => /^\*{0,2}[\(\[]?[A-E][\)\]]?[\.\)]/i.test(t.replace(/<\/?u>/gi, ""))).length;
+    const allJoined = flatCells.join("\n").replace(/<\/?u>/gi, "");
+    const hasExamOpts = strictOptCount >= 2 || /(?:^|\n|\s)\(?A\)?[\.\)]\s+[\s\S]+?\(?B\)?[\.\)]\s+/i.test(allJoined);
+    const hasNumericCol0 = rows.some((r) => /^\d{1,3}[\.\)]?$/.test((r[0]?.text || "").replace(/<\/?u>/gi, "").trim()));
+
+    if (hasExamOpts && (strictOptCount >= Math.ceil(flatCells.length * 0.4) || hasNumericCol0)) {
+      const unwrapped: string[] = [];
+      for (const row of rows) {
+        const filled = row.map((c) => c.text.trim()).filter(Boolean);
+        if (filled.length >= 2 && /^\d{1,3}[\.\)]?$/.test(filled[0].replace(/<\/?u>/gi, "").trim())) {
+          const num = filled[0].replace(/<\/?u>/gi, "").trim().replace(/[\.\)]$/, "");
+          const rest = filled[1];
+          unwrapped.push(/^\d{1,3}[\.\)]/.test(rest.replace(/<\/?u>/gi, "")) ? rest : `${num}. ${rest}`);
+          for (let i = 2; i < filled.length; i++) unwrapped.push(filled[i]);
+        } else {
+          unwrapped.push(...filled);
+        }
+      }
+      return unwrapped;
+    }
+
+    const trHtml = rows
+      .map((r) =>
+        `<tr>${r
+          .map((c) => {
+            const attrs: string[] = [];
+            if (c.colSpan > 1) attrs.push(`colspan="${c.colSpan}"`);
+            if (c.rowSpan > 1) attrs.push(`rowspan="${c.rowSpan}"`);
+            if (c.align !== "left") attrs.push(`data-align="${c.align}"`);
+            const body = c.text
+              .replace(/\[\[IMG_TOKEN:(data:image\/[^\]]+|https?:\/\/[^\]]+)\]\]/g, (_m, u: string) => `<img src="${u.trim()}" />`)
+              .replace(/\n/g, "<br/>");
+            return `<${c.tag}${attrs.length ? " " + attrs.join(" ") : ""}>${body}</${c.tag}>`;
+          })
+          .join("")}</tr>`
+      )
+      .join("");
+    return [`<table>${trHtml}</table>`];
+  };
+
+  const outLines: string[] = [];
+  const walkBlock = (container: Element) => {
+    for (const child of Array.from(container.childNodes)) {
+      if (child.nodeType === 3) {
+        const t = normalizeInlineU(child.nodeValue || "");
+        if (t) outLines.push(t);
+        continue;
+      }
+      if (child.nodeType !== 1) continue;
+      const el = child as Element;
+      const tag = el.tagName;
+      if (tag === "STYLE" || tag === "SCRIPT" || tag === "XML" || tag === "DEL") continue;
+      if (tag === "TABLE") {
+        outLines.push(...serializeClipboardTable(el));
+      } else if (tag === "OL" || tag === "UL") {
+        const listType = (el.getAttribute("type") || "").trim();
+        const lis = Array.from(el.children).filter((c) => c.tagName === "LI");
+        lis.forEach((li, idx) => {
+          const txt = normalizeInlineU(extractInline(li, false));
+          if (!txt) return;
+          if (tag === "OL") {
+            const prefix = listType === "A" ? `${String.fromCharCode(65 + idx)}. ` : listType === "a" ? `${String.fromCharCode(97 + idx)}. ` : `${idx + 1}. `;
+            outLines.push(`${prefix}${txt}`);
+          } else {
+            outLines.push(txt);
+          }
+        });
+      } else if (/^(P|DIV|H[1-6]|BLOCKQUOTE|SECTION|ARTICLE)$/i.test(tag)) {
+        const hasBlockChildren = Array.from(el.children).some((c) =>
+          /^(TABLE|OL|UL|P|DIV|BLOCKQUOTE)$/i.test(c.tagName)
+        );
+        if (hasBlockChildren) {
+          walkBlock(el);
+        } else {
+          const txt = normalizeInlineU(extractInline(el, false));
+          if (txt) outLines.push(txt);
+        }
+      } else {
+        const txt = normalizeInlineU(extractInline(el, false));
+        if (txt) outLines.push(txt);
+      }
+    }
+  };
+
+  walkBlock(doc.body);
+  const result = outLines.join("\n").trim();
+  return result || null;
+}
+
+export function applyWordPasteToInput(
+  e: { clipboardData: DataTransfer; preventDefault: () => void; currentTarget: HTMLTextAreaElement | HTMLInputElement },
+  setValue: (next: string) => void
+): boolean {
+  const html = e.clipboardData?.getData("text/html") || "";
+  if (!html) return false;
+  const converted = convertWordClipboardHtmlToSoalText(html);
+  if (!converted) return false;
+
+  e.preventDefault();
+  const el = e.currentTarget;
+  const val = el.value || "";
+  const start = el.selectionStart ?? val.length;
+  const end = el.selectionEnd ?? val.length;
+  const next = val.slice(0, start) + converted + val.slice(end);
+  setValue(next);
+  return true;
 }

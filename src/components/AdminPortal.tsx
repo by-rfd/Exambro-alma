@@ -10,6 +10,9 @@ import {
   subscribeToSyncStatus,
   clearSyncError,
   getBackendProvider,
+  syncSingleSession,
+  forceSyncNow,
+  restoreFullBackupToBackend,
   SyncStatus,
 } from "../firebaseConfig";
 import {
@@ -92,6 +95,7 @@ import {
   formatSoalKelasNames,
   normalizeSoalKelasIds,
   getClassGradeLevel,
+  sortSoalByUploadOrder,
   SYSTEM_GURU_ID,
 } from "../utils/examQuestionFilter";
 import {
@@ -101,10 +105,16 @@ import {
 import {
   parseMassSoalText,
   buildSoalObjectsFromParsed,
+  applyWordPasteToInput,
   OpsiKey,
 } from "../utils/massSoalParser";
 import { parseDocxSoalFile } from "../utils/docxSoalParser";
-import { compressImageFile } from "../utils/imageUtils";
+import {
+  compressBrandingFile,
+  compressImageFile,
+  optimizeKonfigImages,
+  optimizeSingleSoalImages,
+} from "../utils/imageUtils";
 import RichMathText from "./RichMathText";
 
 interface AdminPortalProps {
@@ -320,25 +330,12 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
       `Apakah Anda yakin ingin memulihkan data dari berkas cadangan "${file.name}"? Data di database akan disinkronkan dengan isi cadangan ini.`,
       () => {
         const reader = new FileReader();
-        reader.onload = (evt) => {
+        reader.onload = async (evt) => {
           try {
             const text = evt.target?.result as string;
             const data = JSON.parse(text);
-
-            let restoredCount = 0;
-            if (Array.isArray(data.soal)) { setDB.soal(data.soal); restoredCount++; }
-            if (Array.isArray(data.siswa)) { setDB.siswa(data.siswa); restoredCount++; }
-            if (Array.isArray(data.guru)) { setDB.guru(data.guru); restoredCount++; }
-            if (Array.isArray(data.pengawas)) { setDB.pengawas(data.pengawas); restoredCount++; }
-            if (Array.isArray(data.jadwalNgawas)) { setDB.jadwalNgawas(data.jadwalNgawas); restoredCount++; }
-            if (Array.isArray(data.jadwal)) { setDB.jadwal(data.jadwal); restoredCount++; }
-            if (Array.isArray(data.mapel)) { setDB.mapel(data.mapel); restoredCount++; }
-            if (Array.isArray(data.kelas)) { setDB.kelas(data.kelas); restoredCount++; }
-            if (Array.isArray(data.kelasAkademik)) { setDB.kelasAkademik(data.kelasAkademik); restoredCount++; }
-            if (data.konfig) { setDB.konfig(data.konfig); restoredCount++; }
-            if (Array.isArray(data.hasil)) { setDB.hasil(data.hasil); restoredCount++; }
-
-            showToast(`Pemulihan berhasil! ${restoredCount} entitas data disinkronkan ke Cloud Firestore.`);
+            const restoredCount = await restoreFullBackupToBackend(data);
+            showToast(`Pemulihan berhasil! ${restoredCount} entitas data disinkronkan ke database Supabase.`);
           } catch (err: any) {
             showToast("Gagal membaca berkas cadangan: " + (err.message || "Pastikan format file JSON valid."), "error");
           }
@@ -674,6 +671,91 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
   const [inputSiswaKelas, setInputSiswaKelas] = useState(""); // represents ruangId / kelasId
   const [inputSiswaNoPeserta, setInputSiswaNoPeserta] = useState("");
   const [editingSiswaId, setEditingSiswaId] = useState<string | null>(null);
+
+  // Manajemen User Filter States
+  const [userSiswaFilterKelas, setUserSiswaFilterKelas] = useState("");
+  const [userSiswaFilterRuang, setUserSiswaFilterRuang] = useState("");
+  const [userSiswaSearch, setUserSiswaSearch] = useState("");
+  const [userGuruFilterKelasId, setUserGuruFilterKelasId] = useState("");
+  const [userGuruSearch, setUserGuruSearch] = useState("");
+
+  const userKelasOptions = React.useMemo(() => {
+    const map = new Map<string, string>();
+    dbState.kelasAkademik.forEach((ka) => {
+      const clean = (ka.nama || "").trim();
+      if (clean && !map.has(clean.toLowerCase())) {
+        map.set(clean.toLowerCase(), clean);
+      }
+    });
+    dbState.siswa.forEach((s) => {
+      const clean = (s.kelas || "").trim();
+      if (clean && !map.has(clean.toLowerCase())) {
+        map.set(clean.toLowerCase(), clean);
+      }
+    });
+    return Array.from(map.values()).sort((a, b) =>
+      a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" })
+    );
+  }, [dbState.kelasAkademik, dbState.siswa]);
+
+  const filteredUserSiswa = React.useMemo(() => {
+    const q = userSiswaSearch.trim().toLowerCase();
+    return dbState.siswa.filter((s) => {
+      if (userSiswaFilterKelas) {
+        const sKelas = (s.kelas || "").trim();
+        if (userSiswaFilterKelas.startsWith("grade:")) {
+          const lvl = userSiswaFilterKelas.replace("grade:", "");
+          if (getNilaiGradeLevel(sKelas) !== lvl) return false;
+        } else if (userSiswaFilterKelas === "__EMPTY__") {
+          if (sKelas !== "") return false;
+        } else if (sKelas.toLowerCase() !== userSiswaFilterKelas.trim().toLowerCase()) {
+          return false;
+        }
+      }
+      if (userSiswaFilterRuang && s.kelasId !== userSiswaFilterRuang) {
+        return false;
+      }
+      if (q) {
+        const matchNama = (s.nama || "").toLowerCase().includes(q);
+        const matchNisn = (s.nisn || "").toLowerCase().includes(q);
+        const matchUser = (s.username || "").toLowerCase().includes(q);
+        const matchPeserta = (s.noPeserta || "").toLowerCase().includes(q);
+        const matchKelas = (s.kelas || "").toLowerCase().includes(q);
+        if (!matchNama && !matchNisn && !matchUser && !matchPeserta && !matchKelas) return false;
+      }
+      return true;
+    });
+  }, [dbState.siswa, userSiswaFilterKelas, userSiswaFilterRuang, userSiswaSearch]);
+
+  const filteredUserGuru = React.useMemo(() => {
+    const q = userGuruSearch.trim().toLowerCase();
+    return dbState.guru.filter((g) => {
+      const ampuanList: GuruAmpuan[] =
+        g.mapelKelas && g.mapelKelas.length > 0
+          ? g.mapelKelas
+          : (g.mapelIds || []).map((id) => ({ mapelId: id, kelasIds: [] }));
+
+      if (userGuruFilterKelasId) {
+        const matchesKelas = ampuanList.some(
+          (mk) => !mk.kelasIds || mk.kelasIds.length === 0 || mk.kelasIds.includes(userGuruFilterKelasId)
+        );
+        if (!matchesKelas) return false;
+      }
+
+      if (q) {
+        const matchNama = (g.nama || "").toLowerCase().includes(q);
+        const matchNip = (g.nip || "").toLowerCase().includes(q);
+        const matchUser = (g.username || "").toLowerCase().includes(q);
+        const matchMapel = ampuanList.some((mk) => {
+          const mName = dbState.mapel.find((m) => m.id === mk.mapelId)?.nama || "";
+          return mName.toLowerCase().includes(q);
+        });
+        if (!matchNama && !matchNip && !matchUser && !matchMapel) return false;
+      }
+
+      return true;
+    });
+  }, [dbState.guru, dbState.mapel, userGuruFilterKelasId, userGuruSearch]);
 
   const handleAddSiswa = (e: React.FormEvent) => {
     e.preventDefault();
@@ -1365,13 +1447,15 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
     });
 
     const items = [...getDB.soal()];
+    const nowTs = Date.now();
     const item: Soal = {
-      id: "soal_" + Date.now(),
+      id: "soal_" + nowTs,
       mapelId: inputSoalMapel,
       teks: inputSoalTeks.trim(),
       opsi: { ...inputSoalOpsi },
       kunci: inputSoalKunci,
       kelasIds: inputSoalKelasIds || [],
+      createdAt: nowTs,
     };
     if (inputSoalImg && inputSoalImg.trim()) {
       item.gambarUrl = inputSoalImg.trim();
@@ -1417,7 +1501,7 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
       const parsedSoals = buildSoalObjectsFromParsed(result.questions, {
         mapelId: inputSoalMapel,
         kelasIds: [...(inputSoalKelasIds || [])],
-        idPrefix: "soal_admin",
+        idPrefix: "soal_admin_",
       });
 
       const updated = [...getDB.soal(), ...parsedSoals];
@@ -1644,17 +1728,15 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
 
   // Admin Live Monitoring controls
   const handleClearSiswaViolations = (id: string) => {
-    const list = [...getDB.sessions()];
-    const index = list.findIndex((s) => s.id === id);
-    if (index !== -1) {
-      list[index] = {
-        ...list[index],
+    const existing = getDB.sessions().find((s) => s.id === id);
+    if (existing) {
+      syncSingleSession({
+        ...existing,
         pelanggaranCount: 0,
         pelanggaranLogs: [],
         status: "Mengerjakan",
         lastUpdated: new Date().toISOString(),
-      };
-      setDB.sessions(list);
+      });
     }
   };
 
@@ -1819,10 +1901,12 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
     }
   }, [activeMenu]);
 
-  const handleSaveKonfig = (e: React.FormEvent) => {
+  const [isCompressingDb, setIsCompressingDb] = useState(false);
+
+  const handleSaveKonfig = async (e: React.FormEvent) => {
     e.preventDefault();
     const currentKonfig = getDB.konfig();
-    const updated: KonfigurasiSekolah = {
+    const rawUpdated: KonfigurasiSekolah = {
       namaSekolah: configNama,
       alamatSekolah: configAlamat,
       kodeRegistrasi: currentKonfig.kodeRegistrasi,
@@ -1836,8 +1920,65 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
       zonaWaktu: configTz,
       batasPelanggaran: Number(configLimit) || 3,
     };
-    setDB.konfig(updated);
-    showToast("Konfigurasi sekolah & Aturan CBT berhasil diperbarui secara global!");
+    const { konfig: optimized } = await optimizeKonfigImages(rawUpdated);
+    setSimLogoKiri(optimized.logoKiriUrl);
+    setSimLogoKanan(optimized.logoKananUrl);
+    if (optimized.stempelSekolahUrl) setSimStempel(optimized.stempelSekolahUrl);
+    if (optimized.ttdKepsekUrl) setSimTtd(optimized.ttdKepsekUrl);
+    setDB.konfig(optimized);
+    showToast("Konfigurasi sekolah & Aturan CBT berhasil dikompres & diperbarui secara global!");
+  };
+
+  const handleOptimizeDatabaseImages = async () => {
+    if (isCompressingDb) return;
+    setIsCompressingDb(true);
+    try {
+      let savedBytes = 0;
+      let optimizedItems = 0;
+
+      const currentKonfig = getDB.konfig();
+      const prevKonfigLen = JSON.stringify(currentKonfig).length;
+      const { konfig: nextKonfig, changed: konfigChanged } = await optimizeKonfigImages(currentKonfig);
+      if (konfigChanged) {
+        const nextKonfigLen = JSON.stringify(nextKonfig).length;
+        savedBytes += Math.max(0, prevKonfigLen - nextKonfigLen);
+        optimizedItems += 1;
+        setDB.konfig(nextKonfig);
+        setSimLogoKiri(nextKonfig.logoKiriUrl);
+        setSimLogoKanan(nextKonfig.logoKananUrl);
+        if (nextKonfig.stempelSekolahUrl) setSimStempel(nextKonfig.stempelSekolahUrl);
+        if (nextKonfig.ttdKepsekUrl) setSimTtd(nextKonfig.ttdKepsekUrl);
+      }
+
+      const currentSoal = getDB.soal();
+      const nextSoalList: Soal[] = [];
+      let soalChangedCount = 0;
+      for (const s of currentSoal) {
+        const prevLen = JSON.stringify(s).length;
+        const { soal: optSoal, changed } = await optimizeSingleSoalImages(s);
+        if (changed) {
+          const nextLen = JSON.stringify(optSoal).length;
+          savedBytes += Math.max(0, prevLen - nextLen);
+          soalChangedCount += 1;
+          optimizedItems += 1;
+        }
+        nextSoalList.push(optSoal);
+      }
+      if (soalChangedCount > 0) {
+        setDB.soal(nextSoalList);
+      }
+
+      if (optimizedItems === 0) {
+        showToast("Semua gambar di Bank Soal & Konfigurasi sudah optimal dan ringkas!");
+      } else {
+        const savedKb = Math.round(savedBytes / 1024);
+        showToast(`Berhasil mengompres ${optimizedItems} aset/soal — hemat ${savedKb.toLocaleString("id-ID")} KB kuota Supabase!`);
+      }
+    } catch {
+      showToast("Gagal mengompres gambar database.", "error");
+    } finally {
+      setIsCompressingDb(false);
+    }
   };
 
   const getGuruGradeLevel = (nama: string): "X" | "XI" | "XII" | "Lainnya" => {
@@ -2180,26 +2321,31 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5">
-            {isFirebaseConfigured && (
-              <div
-                className={`px-3 py-1.5 rounded-xl border text-[11px] font-bold flex items-center gap-1.5 ${
-                  syncStatus.lastError
-                    ? "bg-rose-50 text-rose-700 border-rose-200"
-                    : syncStatus.pendingCount > 0
-                    ? "bg-amber-50 text-amber-700 border-amber-200"
-                    : "bg-emerald-50 text-emerald-700 border-emerald-200"
-                }`}
-              >
-                <Cloud size={14} className={syncStatus.pendingCount > 0 ? "animate-pulse" : ""} />
-                <span>
-                  {syncStatus.lastError
-                    ? "Gagal Sync Cloud"
-                    : syncStatus.pendingCount > 0
-                    ? "Menyimpan ke Cloud..."
-                    : "Cloud Sync Aktif"}
-                </span>
-              </div>
-            )}
+            <button
+              type="button"
+              onClick={() => {
+                void forceSyncNow(true);
+              }}
+              title="Klik untuk sinkronisasi paksa dengan server"
+              className={`px-3 py-1.5 rounded-xl border text-[11px] font-bold flex items-center gap-1.5 cursor-pointer transition hover:opacity-85 ${
+                syncStatus.lastError
+                  ? "bg-rose-50 text-rose-700 border-rose-200"
+                  : !syncStatus.cloudReady || syncStatus.pendingCount > 0
+                  ? "bg-amber-50 text-amber-700 border-amber-200"
+                  : "bg-emerald-50 text-emerald-700 border-emerald-200"
+              }`}
+            >
+              <Cloud size={14} className={!syncStatus.cloudReady || syncStatus.pendingCount > 0 ? "animate-pulse" : ""} />
+              <span>
+                {syncStatus.lastError
+                  ? "Sinkronkan Ulang"
+                  : !syncStatus.cloudReady
+                  ? "Memuat Database..."
+                  : syncStatus.pendingCount > 0
+                  ? "Menyimpan ke Cloud..."
+                  : "Cloud Sync Aktif"}
+              </span>
+            </button>
 
             <div className="flex items-center gap-4 bg-slate-50 p-2 px-3 rounded-xl border border-slate-200 text-xs text-left shadow-sm">
               <div className="shrink-0 flex items-center justify-center w-8 h-8 rounded-full bg-amber-50 border border-amber-200 text-amber-500 animate-pulse">
@@ -2851,7 +2997,11 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
                   <div className="flex justify-between items-center pb-2 border-b border-slate-200">
                     <h4 className="text-xs font-black text-slate-700 uppercase flex items-center gap-1.5">
                       <Users size={15} className="text-[#0666AE]" />
-                      SISWA AKTIF ({dbState.siswa.length} Record)
+                      SISWA AKTIF (
+                      {userSiswaFilterKelas || userSiswaFilterRuang || userSiswaSearch.trim()
+                        ? `${filteredUserSiswa.length} / ${dbState.siswa.length}`
+                        : `${dbState.siswa.length}`}{" "}
+                      Record)
                     </h4>
                     {dbState.siswa.length > 0 && (
                       <button
@@ -2994,41 +3144,147 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
                     </div>
                   </form>
 
-                  <div className="max-h-[300px] overflow-y-auto space-y-2 text-xs pr-1">
-                    {dbState.siswa.map((s) => (
-                      <div
-                        key={s.id}
-                        className="p-3 bg-white rounded-xl border border-slate-100 flex justify-between items-center shadow-sm hover:border-[#0666AE]/20 transition-all font-sans"
+                  {/* Filter Bar Siswa per Kelas & Pencarian */}
+                  <div className="p-3 bg-white rounded-xl border border-slate-200/80 space-y-2 shadow-2xs">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-black uppercase text-[#0666AE] flex items-center gap-1">
+                        <Filter size={11} />
+                        Filter Daftar Siswa
+                      </span>
+                      {(userSiswaFilterKelas || userSiswaFilterRuang || userSiswaSearch.trim()) && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setUserSiswaFilterKelas("");
+                            setUserSiswaFilterRuang("");
+                            setUserSiswaSearch("");
+                          }}
+                          className="text-[10px] font-bold text-rose-600 hover:underline flex items-center gap-0.5 cursor-pointer"
+                        >
+                          <X size={11} />
+                          Reset Filter
+                        </button>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px]">
+                      <select
+                        value={userSiswaFilterKelas}
+                        onChange={(e) => setUserSiswaFilterKelas(e.target.value)}
+                        className="w-full p-2 bg-slate-50 border border-slate-200 rounded-xl font-bold text-slate-700 focus:outline-none focus:border-[#0666AE] cursor-pointer"
+                        title="Filter siswa berdasarkan kelas"
                       >
-                        <div className="text-left flex-1 min-w-0 pr-2">
-                          <p className="font-extrabold text-slate-800 text-[13px] truncate">{s.nama}</p>
-                          <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[10px] text-slate-400 mt-1.5 font-medium leading-relaxed">
-                            <p>NISN: <span className="font-mono text-slate-600 font-bold bg-slate-50 px-1 py-0.2 rounded">{s.nisn}</span></p>
-                            <p>No. Peserta: <span className="font-mono text-emerald-600 font-bold bg-emerald-50 px-1 py-0.2 rounded">{s.noPeserta || "-"}</span></p>
-                            <p>Username: <span className="text-[#0666AE] font-bold">{s.username}</span></p>
-                            <p>Password: <span className="text-purple-600 font-mono font-bold">{s.password || "Password123"}</span></p>
-                            <p>Kelas: <span className="text-slate-700 font-extrabold">{s.kelas || "-"}</span></p>
-                            <p>Ruang CBT: <span className="text-amber-600 font-extrabold">{dbState.kelas.find((k) => k.id === s.kelasId)?.nama || "-"}</span></p>
+                        <option value="">Semua Kelas ({dbState.siswa.length})</option>
+                        {(["X", "XI", "XII"] as const).some((lvl) =>
+                          dbState.siswa.some((s) => getNilaiGradeLevel(s.kelas || "") === lvl)
+                        ) && (
+                          <optgroup label="Per Angkatan">
+                            {(["X", "XI", "XII"] as const).map((lvl) => {
+                              const count = dbState.siswa.filter(
+                                (s) => getNilaiGradeLevel(s.kelas || "") === lvl
+                              ).length;
+                              if (count === 0) return null;
+                              return (
+                                <option key={`grade:${lvl}`} value={`grade:${lvl}`}>
+                                  Semua Kelas {lvl} ({count})
+                                </option>
+                              );
+                            })}
+                          </optgroup>
+                        )}
+                        {userKelasOptions.length > 0 && (
+                          <optgroup label="Per Kelas">
+                            {userKelasOptions.map((kName) => {
+                              const count = dbState.siswa.filter(
+                                (s) => (s.kelas || "").trim().toLowerCase() === kName.toLowerCase()
+                              ).length;
+                              return (
+                                <option key={kName} value={kName}>
+                                  {kName} ({count})
+                                </option>
+                              );
+                            })}
+                          </optgroup>
+                        )}
+                        {dbState.siswa.some((s) => !(s.kelas || "").trim()) && (
+                          <option value="__EMPTY__">
+                            Belum Ada Kelas ({dbState.siswa.filter((s) => !(s.kelas || "").trim()).length})
+                          </option>
+                        )}
+                      </select>
+
+                      <select
+                        value={userSiswaFilterRuang}
+                        onChange={(e) => setUserSiswaFilterRuang(e.target.value)}
+                        className="w-full p-2 bg-slate-50 border border-slate-200 rounded-xl font-bold text-slate-700 focus:outline-none focus:border-[#0666AE] cursor-pointer"
+                        title="Filter siswa berdasarkan ruang CBT"
+                      >
+                        <option value="">Semua Ruang CBT</option>
+                        {dbState.kelas.map((k) => {
+                          const count = dbState.siswa.filter((s) => s.kelasId === k.id).length;
+                          return (
+                            <option key={k.id} value={k.id}>
+                              {k.nama} ({count})
+                            </option>
+                          );
+                        })}
+                      </select>
+
+                      <div className="relative">
+                        <Search size={13} className="absolute left-2.5 top-2.5 text-slate-400" />
+                        <input
+                          type="text"
+                          value={userSiswaSearch}
+                          onChange={(e) => setUserSiswaSearch(e.target.value)}
+                          placeholder="Cari nama / NISN / user..."
+                          className="w-full pl-8 pr-2.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-slate-700 font-medium focus:outline-none focus:border-[#0666AE] focus:bg-white"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="max-h-[320px] overflow-y-auto space-y-2 text-xs pr-1">
+                    {filteredUserSiswa.length === 0 ? (
+                      <div className="p-6 text-center bg-white rounded-xl border border-dashed border-slate-200 text-slate-400 font-semibold">
+                        {dbState.siswa.length === 0
+                          ? "Belum ada data siswa terdaftar."
+                          : "Tidak ada siswa yang cocok dengan filter kelas atau pencarian."}
+                      </div>
+                    ) : (
+                      filteredUserSiswa.map((s) => (
+                        <div
+                          key={s.id}
+                          className="p-3 bg-white rounded-xl border border-slate-100 flex justify-between items-center shadow-sm hover:border-[#0666AE]/20 transition-all font-sans"
+                        >
+                          <div className="text-left flex-1 min-w-0 pr-2">
+                            <p className="font-extrabold text-slate-800 text-[13px] truncate">{s.nama}</p>
+                            <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[10px] text-slate-400 mt-1.5 font-medium leading-relaxed">
+                              <p>NISN: <span className="font-mono text-slate-600 font-bold bg-slate-50 px-1 py-0.2 rounded">{s.nisn}</span></p>
+                              <p>No. Peserta: <span className="font-mono text-emerald-600 font-bold bg-emerald-50 px-1 py-0.2 rounded">{s.noPeserta || "-"}</span></p>
+                              <p>Username: <span className="text-[#0666AE] font-bold">{s.username}</span></p>
+                              <p>Password: <span className="text-purple-600 font-mono font-bold">{s.password || "Password123"}</span></p>
+                              <p>Kelas: <span className="text-slate-700 font-extrabold">{s.kelas || "-"}</span></p>
+                              <p>Ruang CBT: <span className="text-amber-600 font-extrabold">{dbState.kelas.find((k) => k.id === s.kelasId)?.nama || "-"}</span></p>
+                            </div>
+                          </div>
+                          <div className="flex gap-1">
+                            <button
+                              onClick={() => handleEditSiswaClick(s)}
+                              className="text-slate-400 hover:text-amber-600 p-2 transition-colors cursor-pointer rounded-xl hover:bg-amber-50"
+                              title="Edit Data Siswa"
+                            >
+                              <Edit size={13} />
+                            </button>
+                            <button
+                              onClick={() => handleDeleteSiswa(s.id)}
+                              className="text-slate-400 hover:text-red-600 p-2 transition-colors cursor-pointer rounded-xl hover:bg-red-50"
+                              title="Hapus Siswa Dr Pangkalan Data"
+                            >
+                              <Trash2 size={13} />
+                            </button>
                           </div>
                         </div>
-                        <div className="flex gap-1">
-                          <button
-                            onClick={() => handleEditSiswaClick(s)}
-                            className="text-slate-400 hover:text-amber-600 p-2 transition-colors cursor-pointer rounded-xl hover:bg-amber-50"
-                            title="Edit Data Siswa"
-                          >
-                            <Edit size={13} />
-                          </button>
-                          <button
-                            onClick={() => handleDeleteSiswa(s.id)}
-                            className="text-slate-400 hover:text-red-600 p-2 transition-colors cursor-pointer rounded-xl hover:bg-red-50"
-                            title="Hapus Siswa Dr Pangkalan Data"
-                          >
-                            <Trash2 size={13} />
-                          </button>
-                        </div>
-                      </div>
-                    ))}
+                      ))
+                    )}
                   </div>
                 </div>
 
@@ -3037,7 +3293,11 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
                   <div className="flex flex-wrap justify-between items-center pb-2 border-b border-slate-200 gap-2">
                     <h4 className="text-xs font-black text-slate-700 uppercase flex items-center gap-1.5">
                       <Shield size={15} className="text-emerald-600" />
-                      DEWAN GURU ({dbState.guru.length} Guru)
+                      DEWAN GURU (
+                      {userGuruFilterKelasId || userGuruSearch.trim()
+                        ? `${filteredUserGuru.length} / ${dbState.guru.length}`
+                        : `${dbState.guru.length}`}{" "}
+                      Guru)
                     </h4>
                     <div className="flex items-center gap-1.5">
                       <button
@@ -3354,8 +3614,64 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
                     </div>
                   </form>
 
-                  <div className="max-h-[300px] overflow-y-auto space-y-2 text-xs pr-1">
-                    {dbState.guru.map((g) => {
+                  {/* Filter Bar Dewan Guru per Kelas Diajar & Pencarian */}
+                  <div className="p-3 bg-white rounded-xl border border-slate-200/80 space-y-2 shadow-2xs">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[10px] font-black uppercase text-emerald-700 flex items-center gap-1">
+                        <Filter size={11} />
+                        Filter Daftar Guru
+                      </span>
+                      {(userGuruFilterKelasId || userGuruSearch.trim()) && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setUserGuruFilterKelasId("");
+                            setUserGuruSearch("");
+                          }}
+                          className="text-[10px] font-bold text-rose-600 hover:underline flex items-center gap-0.5 cursor-pointer"
+                        >
+                          <X size={11} />
+                          Reset Filter
+                        </button>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px]">
+                      <select
+                        value={userGuruFilterKelasId}
+                        onChange={(e) => setUserGuruFilterKelasId(e.target.value)}
+                        className="w-full p-2 bg-slate-50 border border-slate-200 rounded-xl font-bold text-slate-700 focus:outline-none focus:border-emerald-600 cursor-pointer"
+                        title="Filter guru berdasarkan kelas yang diajar"
+                      >
+                        <option value="">Semua Kelas Diajar ({dbState.guru.length})</option>
+                        {dbState.kelasAkademik.map((ka) => (
+                          <option key={ka.id} value={ka.id}>
+                            Kelas {ka.nama}
+                          </option>
+                        ))}
+                      </select>
+
+                      <div className="relative">
+                        <Search size={13} className="absolute left-2.5 top-2.5 text-slate-400" />
+                        <input
+                          type="text"
+                          value={userGuruSearch}
+                          onChange={(e) => setUserGuruSearch(e.target.value)}
+                          placeholder="Cari nama / NIP / mapel guru..."
+                          className="w-full pl-8 pr-2.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-slate-700 font-medium focus:outline-none focus:border-emerald-600 focus:bg-white"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="max-h-[320px] overflow-y-auto space-y-2 text-xs pr-1">
+                    {filteredUserGuru.length === 0 ? (
+                      <div className="p-6 text-center bg-white rounded-xl border border-dashed border-slate-200 text-slate-400 font-semibold">
+                        {dbState.guru.length === 0
+                          ? "Belum ada data guru terdaftar."
+                          : "Tidak ada guru yang cocok dengan filter kelas atau pencarian."}
+                      </div>
+                    ) : (
+                      filteredUserGuru.map((g) => {
                       const ampuanList: GuruAmpuan[] =
                         g.mapelKelas && g.mapelKelas.length > 0
                           ? g.mapelKelas
@@ -3423,7 +3739,8 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
                         </div>
                       </div>
                       );
-                    })}
+                    })
+                    )}
                   </div>
                 </div>
               </div>
@@ -3583,12 +3900,17 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
                     }
                   });
 
-                  // Convert to array and sort by Mapel Name then Class Name
-                  return Object.values(groups).sort((a, b) => {
-                    const mComp = a.mapelNama.localeCompare(b.mapelNama);
-                    if (mComp !== 0) return mComp;
-                    return a.kelasNama.localeCompare(b.kelasNama);
-                  });
+                  // Convert to array, sort each group's questions by upload order, and sort groups by Mapel Name then Class Name
+                  return Object.values(groups)
+                    .map((g) => ({
+                      ...g,
+                      soalList: sortSoalByUploadOrder(g.soalList),
+                    }))
+                    .sort((a, b) => {
+                      const mComp = a.mapelNama.localeCompare(b.mapelNama);
+                      if (mComp !== 0) return mComp;
+                      return a.kelasNama.localeCompare(b.kelasNama);
+                    });
                 })();
 
                 return (
@@ -5761,14 +6083,11 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
                             file:text-[9.5px] file:font-semibold
                             file:bg-[#0666AE]/10 file:text-[#0666AE]
                             hover:file:bg-[#0666AE]/15 cursor-pointer"
-                          onChange={(e) => {
+                          onChange={async (e) => {
                             const file = e.target.files?.[0];
                             if (file) {
-                              const reader = new FileReader();
-                              reader.onload = (evt) => {
-                                if (evt.target?.result) setSimLogoKiri(evt.target.result as string);
-                              };
-                              reader.readAsDataURL(file);
+                              const compressed = await compressBrandingFile(file);
+                              setSimLogoKiri(compressed);
                             }
                           }}
                         />
@@ -5793,14 +6112,11 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
                             file:text-[9.5px] file:font-semibold
                             file:bg-[#0666AE]/10 file:text-[#0666AE]
                             hover:file:bg-[#0666AE]/15 cursor-pointer"
-                          onChange={(e) => {
+                          onChange={async (e) => {
                             const file = e.target.files?.[0];
                             if (file) {
-                              const reader = new FileReader();
-                              reader.onload = (evt) => {
-                                if (evt.target?.result) setSimLogoKanan(evt.target.result as string);
-                              };
-                              reader.readAsDataURL(file);
+                              const compressed = await compressBrandingFile(file);
+                              setSimLogoKanan(compressed);
                             }
                           }}
                         />
@@ -5828,14 +6144,11 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
                                 file:text-[8px] file:font-semibold
                                 file:bg-[#0666AE]/10 file:text-[#0666AE]
                                 hover:file:bg-[#0666AE]/15 cursor-pointer"
-                              onChange={(e) => {
+                              onChange={async (e) => {
                                 const file = e.target.files?.[0];
                                 if (file) {
-                                  const reader = new FileReader();
-                                  reader.onload = (evt) => {
-                                    if (evt.target?.result) setSimStempel(evt.target.result as string);
-                                  };
-                                  reader.readAsDataURL(file);
+                                  const compressed = await compressBrandingFile(file);
+                                  setSimStempel(compressed);
                                 }
                               }}
                             />
@@ -5858,14 +6171,11 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
                                 file:text-[8px] file:font-semibold
                                 file:bg-[#0666AE]/10 file:text-[#0666AE]
                                 hover:file:bg-[#0666AE]/15 cursor-pointer"
-                              onChange={(e) => {
+                              onChange={async (e) => {
                                 const file = e.target.files?.[0];
                                 if (file) {
-                                  const reader = new FileReader();
-                                  reader.onload = (evt) => {
-                                    if (evt.target?.result) setSimTtd(evt.target.result as string);
-                                  };
-                                  reader.readAsDataURL(file);
+                                  const compressed = await compressBrandingFile(file);
+                                  setSimTtd(compressed);
                                 }
                               }}
                             />
@@ -5977,6 +6287,27 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
                       />
                     </label>
                   </div>
+                </div>
+
+                {/* Image & Egress Compression Optimizer */}
+                <div className="p-4 bg-amber-50/70 border border-amber-200 rounded-xl flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                  <div>
+                    <h5 className="font-black text-amber-900 uppercase text-[11px]">
+                      Kompres Semua Gambar Database (Hemat Kuota Supabase)
+                    </h5>
+                    <p className="text-[10px] text-amber-800/80 font-medium leading-relaxed mt-0.5">
+                      Otomatis mengecilkan gambar soal, opsi jawaban, logo, stempel, dan tanda tangan ke format WebP ringan tanpa mengurangi ketajaman agar aman di paket gratis 5 GB.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleOptimizeDatabaseImages}
+                    disabled={isCompressingDb}
+                    className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-bold text-xs flex items-center gap-1.5 transition shadow-sm cursor-pointer shrink-0 disabled:opacity-50"
+                  >
+                    <RotateCw size={13} className={isCompressingDb ? "animate-spin" : ""} />
+                    <span>{isCompressingDb ? "Mengompres..." : "Kompres Gambar Sekarang"}</span>
+                  </button>
                 </div>
 
                 {/* Seeding with safety warning */}
@@ -6900,7 +7231,13 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
                                 </div>
 
                                 <p className="font-bold text-slate-800 text-[12px] leading-snug line-clamp-2">
-                                  {s.teks || <span className="italic text-slate-400">(Teks soal kosong)</span>}
+                                  {s.teks
+                                    ? s.teks
+                                        .replace(/<table\b[\s\S]*?<\/table>/gi, " [Tabel] ")
+                                        .replace(/<\/?u>/gi, "")
+                                        .replace(/\s+/g, " ")
+                                        .trim()
+                                    : <span className="italic text-slate-400">(Teks soal kosong)</span>}
                                 </p>
 
                                 <div className="flex flex-wrap items-center gap-2 text-[10px] text-slate-500 font-semibold">
@@ -7072,7 +7409,7 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
                       <span>Upload Langsung File Microsoft Word (.docx)</span>
                     </p>
                     <p className="text-[10px] text-slate-600 font-medium">
-                      Otomatis mengekstrak soal teks, Arab RTL (١. أ ب ج د هـ), Inggris, rumus Equation ($...$), dan gambar soal/opsi!
+                      Otomatis mengekstrak soal teks, tabel, kata bergaris bawah, Arab RTL (١. أ ب ج د هـ), Inggris, rumus Equation ($...$), dan gambar soal/opsi!
                     </p>
                   </div>
                   <label className={`px-3.5 py-2 rounded-xl font-extrabold text-[11px] flex items-center justify-center gap-1.5 cursor-pointer shrink-0 shadow-sm transition ${
@@ -7125,6 +7462,7 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
                     rows={8}
                     value={massSoalText}
                     onChange={(e) => setMassSoalText(e.target.value)}
+                    onPaste={(e) => applyWordPasteToInput(e, setMassSoalText)}
                     placeholder={`Contoh format:\n1. Hitung nilai $\\frac{3}{4} + \\frac{1}{2} = \\dots$\nA. $\\frac{5}{4}$\nB. $\\frac{4}{6}$\nC. 1\nD. 2\nKunci: A\n\n٢. ما معنى كلمة «مدرسة»؟\nأ. Rumah\nب. Sekolah\nج. Masjid\nد. Pasar\nالمفتاح: ب`}
                     className="w-full p-3 bg-white border border-slate-200 rounded-xl text-slate-800 font-mono text-[11px] leading-relaxed focus:outline-none focus:border-[#0666AE]"
                     required
@@ -7170,6 +7508,7 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
                     rows={3}
                     value={inputSoalTeks}
                     onChange={(e) => setInputSoalTeks(e.target.value)}
+                    onPaste={(e) => applyWordPasteToInput(e, setInputSoalTeks)}
                     dir="auto"
                     placeholder="Ketik pertanyaan soal di sini... (Untuk rumus matematika gunakan $...$, misal $\frac{a}{b}$)"
                     className="w-full p-2.5 bg-white border border-slate-200 rounded-xl text-slate-800 font-medium focus:outline-none focus:border-[#0666AE]"
@@ -7432,6 +7771,7 @@ export default function AdminPortal({ onLogout, adminEmail }: AdminPortalProps) 
                   dir="auto"
                   value={editSoalTeks}
                   onChange={(e) => setEditSoalTeks(e.target.value)}
+                  onPaste={(e) => applyWordPasteToInput(e, setEditSoalTeks)}
                   className="w-full p-2.5 bg-white border border-slate-200 rounded-xl text-slate-800 font-medium focus:outline-none focus:border-[#0666AE]"
                   placeholder="Tuliskan pertanyaan ujian..."
                   required

@@ -7,7 +7,11 @@ import {
   notifySync,
   isFirebaseConfigured,
   setSyncMode,
-  syncSingleSession
+  syncSingleSession,
+  syncSingleHasil,
+  updateLocalSessionCache,
+  fetchSoalForMapel,
+  fetchStudentSession
 } from "../firebaseConfig";
 import { 
   Smartphone, 
@@ -33,7 +37,7 @@ import {
 import { motion, AnimatePresence } from "motion/react";
 import { Siswa, Soal, JadwalUjian, SesiSiswa, HasilUjian } from "../types";
 import { filterQuestionsForJadwal, canonicalClassAlias } from "../utils/examQuestionFilter";
-import RichMathText, { hasArabicText } from "./RichMathText";
+import RichMathText, { isDominantlyArabic } from "./RichMathText";
 
 export default function StudentSimulator({ standalone = false }: { standalone?: boolean }) {
   // Device Hardware states
@@ -243,7 +247,7 @@ export default function StudentSimulator({ standalone = false }: { standalone?: 
   const pendingSessionRef = useRef<SesiSiswa | null>(null);
   const sessionSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const flushSessionSync = (explicitSession?: SesiSiswa) => {
+  const flushSessionSync = (explicitSession?: SesiSiswa, keepalive = false) => {
     if (sessionSyncTimerRef.current) {
       clearTimeout(sessionSyncTimerRef.current);
       sessionSyncTimerRef.current = null;
@@ -251,16 +255,13 @@ export default function StudentSimulator({ standalone = false }: { standalone?: 
     const target = explicitSession || pendingSessionRef.current;
     pendingSessionRef.current = null;
     if (target) {
-      syncSingleSession(target);
+      syncSingleSession(target, keepalive);
     }
   };
 
   const scheduleSessionSync = (session: SesiSiswa) => {
-    // Save immediately to localStorage + notify React state so refresh/infractions keep every answer
-    const current = getDB.sessions();
-    const next = [...current.filter((s) => s.id !== session.id), session];
-    localStorage.setItem("exambro_sessions", JSON.stringify(next));
-    notifySync();
+    // Save immediately to memory/local cache + notify React state so refresh/infractions keep every answer
+    updateLocalSessionCache(session);
     pendingSessionRef.current = session;
     if (sessionSyncTimerRef.current) return;
     sessionSyncTimerRef.current = setTimeout(() => {
@@ -270,13 +271,13 @@ export default function StudentSimulator({ standalone = false }: { standalone?: 
       if (toSend) {
         syncSingleSession(toSend);
       }
-    }, 15000);
+    }, 5000);
   };
 
   useEffect(() => {
     setSyncMode(loggedInStudent ? "student" : "staff", loggedInStudent?.nisn);
     return () => {
-      flushSessionSync();
+      flushSessionSync(undefined, true);
       setSyncMode("staff");
     };
   }, [loggedInStudent?.nisn]);
@@ -284,10 +285,10 @@ export default function StudentSimulator({ standalone = false }: { standalone?: 
   useEffect(() => {
     const handleFlush = () => {
       if (document.visibilityState === "hidden") {
-        flushSessionSync();
+        flushSessionSync(undefined, true);
       }
     };
-    const handlePageHide = () => flushSessionSync();
+    const handlePageHide = () => flushSessionSync(undefined, true);
     document.addEventListener("visibilitychange", handleFlush);
     window.addEventListener("pagehide", handlePageHide);
     return () => {
@@ -511,6 +512,7 @@ export default function StudentSimulator({ standalone = false }: { standalone?: 
   // Token entry state
   const [tokenInput, setTokenInput] = useState("");
   const [tokenError, setTokenError] = useState<string | null>(null);
+  const [tokenLoading, setTokenLoading] = useState(false);
 
   // Ongoing Exam state
   const [questions, setQuestions] = useState<Soal[]>([]);
@@ -831,12 +833,14 @@ export default function StudentSimulator({ standalone = false }: { standalone?: 
     setScreen("token-entry");
     setTokenInput("");
     setTokenError(null);
+    // Prefetch questions in background while student types the exam token
+    void fetchSoalForMapel(jadwal.mapelId);
   };
 
-  // Verifies dynamic tokens and launches physical exam frame
-  const handleVerifyToken = () => {
+  // Verifies dynamic tokens and launches physical exam frame (loads only questions for selected mapel)
+  const handleVerifyToken = async () => {
     setTokenError(null);
-    if (!selectedJadwal) return;
+    if (!selectedJadwal || !loggedInStudent || tokenLoading) return;
 
     // Check if the input matches any active token for this mapel
     const matchedTokenObj = dbState.tokens.find(
@@ -852,75 +856,101 @@ export default function StudentSimulator({ standalone = false }: { standalone?: 
       return;
     }
 
-    // Initialize exam questions (honoring manual soalIds, guruIds filter, and normalized class matching)
-    const academicClasses = getDB.kelasAkademik();
-    const studentClassName = (loggedInStudent?.kelas || "").trim();
-    const studentAlias = canonicalClassAlias(studentClassName);
+    setTokenLoading(true);
+    try {
+      const [mapelSoal, remoteSession] = await Promise.all([
+        fetchSoalForMapel(selectedJadwal.mapelId),
+        fetchStudentSession(loggedInStudent.nisn),
+      ]);
 
-    const studentClassObj = academicClasses.find(
-      (ka) =>
-        ka.nama.trim().toLowerCase() === studentClassName.toLowerCase() ||
-        ka.id.trim().toLowerCase() === studentClassName.toLowerCase() ||
-        (studentAlias && canonicalClassAlias(ka.nama) === studentAlias)
-    );
-    const studentClassId = studentClassObj ? studentClassObj.id : "";
+      // Initialize exam questions (honoring manual soalIds, guruIds filter, and normalized class matching)
+      const academicClasses = getDB.kelasAkademik();
+      const studentClassName = (loggedInStudent.kelas || "").trim();
+      const studentAlias = canonicalClassAlias(studentClassName);
 
-    const allQuestions = filterQuestionsForJadwal(selectedJadwal, dbState.soal, academicClasses, {
-      studentClassName,
-      studentClassId,
-    });
+      const studentClassObj = academicClasses.find(
+        (ka) =>
+          ka.nama.trim().toLowerCase() === studentClassName.toLowerCase() ||
+          ka.id.trim().toLowerCase() === studentClassName.toLowerCase() ||
+          (studentAlias && canonicalClassAlias(ka.nama) === studentAlias)
+      );
+      const studentClassId = studentClassObj ? studentClassObj.id : "";
 
-    if (allQuestions.length === 0) {
-      setTokenError("Ujian sedang disiapkan. Tidak ada butir soal ditemukan untuk mata pelajaran dan kelas Anda.");
-      return;
+      let sourceSoal = mapelSoal.length > 0 ? mapelSoal : dbState.soal;
+      let allQuestions = filterQuestionsForJadwal(selectedJadwal, sourceSoal, academicClasses, {
+        studentClassName,
+        studentClassId,
+      });
+
+      if (allQuestions.length === 0) {
+        const retriedSoal = await fetchSoalForMapel(selectedJadwal.mapelId);
+        if (retriedSoal.length > 0) {
+          sourceSoal = retriedSoal;
+          allQuestions = filterQuestionsForJadwal(selectedJadwal, sourceSoal, academicClasses, {
+            studentClassName,
+            studentClassId,
+          });
+        }
+      }
+
+      if (allQuestions.length === 0) {
+        setTokenError("Soal belum ditemukan untuk mata pelajaran dan kelas Anda. Pastikan koneksi stabil lalu coba lagi, atau hubungi Proktor.");
+        return;
+      }
+
+      const latestSessions = remoteSession
+        ? [...dbState.sessions.filter((s) => s.id !== remoteSession.id), remoteSession]
+        : dbState.sessions;
+
+      const existingOngoing = latestSessions.find(
+        (s) =>
+          s.id === loggedInStudent.nisn &&
+          s.status === "Mengerjakan" &&
+          (s.mapelId === selectedJadwal.mapelId ||
+            (s.mapelNama || "").trim().toLowerCase() === mapelNama.trim().toLowerCase())
+      );
+
+      const resumedAnswers = existingOngoing?.jawabanSiswa || {};
+      const resumedRagu = existingOngoing?.raguRagu || {};
+      const resumedFilled = Object.keys(resumedAnswers).filter((k) => resumedAnswers[Number(k)]).length;
+
+      // Set duration & initialize exam states (clean if new or after Reset Sesi)
+      setSecondsRemaining(selectedJadwal.durasiMenit * 60);
+      setQuestions(allQuestions);
+      setCurrentIndex(0);
+      setStudentAnswers(resumedAnswers);
+      setRaguRaguAnswers(resumedRagu);
+      setSessionResetNotice(null);
+      setSessionForceFinishedNotice(false);
+      activeSessionCreatedRef.current = true;
+
+      // Register active CBT session dynamically
+      const studentSessi: SesiSiswa = {
+        id: loggedInStudent.nisn,
+        siswaNama: loggedInStudent.nama,
+        siswaKelas: loggedInStudent.kelas,
+        mapelId: selectedJadwal.mapelId,
+        mapelNama: mapelNama,
+        jadwalId: selectedJadwal.id,
+        questionIds: existingOngoing?.questionIds?.length ? existingOngoing.questionIds : allQuestions.map((q) => q.id),
+        status: "Mengerjakan",
+        deviceId: existingOngoing?.deviceId || "Android-Device",
+        pelanggaranCount: existingOngoing?.pelanggaranCount || 0,
+        pelanggaranLogs: existingOngoing?.pelanggaranLogs || [],
+        jawabanTerisi: resumedFilled,
+        totalSoal: allQuestions.length,
+        raguRagu: resumedRagu,
+        jawabanSiswa: resumedAnswers,
+        lastUpdated: new Date().toISOString()
+      };
+
+      // Push new exam session atomically without colliding with other students
+      flushSessionSync(studentSessi);
+
+      setScreen("exam");
+    } finally {
+      setTokenLoading(false);
     }
-
-    const existingOngoing = dbState.sessions.find(
-      (s) =>
-        s.id === loggedInStudent!.nisn &&
-        s.status === "Mengerjakan" &&
-        (s.mapelId === selectedJadwal.mapelId ||
-          (s.mapelNama || "").trim().toLowerCase() === mapelNama.trim().toLowerCase())
-    );
-
-    const resumedAnswers = existingOngoing?.jawabanSiswa || {};
-    const resumedRagu = existingOngoing?.raguRagu || {};
-    const resumedFilled = Object.keys(resumedAnswers).filter((k) => resumedAnswers[Number(k)]).length;
-
-    // Set duration & initialize exam states (clean if new or after Reset Sesi)
-    setSecondsRemaining(selectedJadwal.durasiMenit * 60);
-    setQuestions(allQuestions);
-    setCurrentIndex(0);
-    setStudentAnswers(resumedAnswers);
-    setRaguRaguAnswers(resumedRagu);
-    setSessionResetNotice(null);
-    setSessionForceFinishedNotice(false);
-    activeSessionCreatedRef.current = true;
-
-    // Register active CBT session dynamically
-    const studentSessi: SesiSiswa = {
-      id: loggedInStudent!.nisn,
-      siswaNama: loggedInStudent!.nama,
-      siswaKelas: loggedInStudent!.kelas,
-      mapelId: selectedJadwal.mapelId,
-      mapelNama: mapelNama,
-      jadwalId: selectedJadwal.id,
-      questionIds: existingOngoing?.questionIds?.length ? existingOngoing.questionIds : allQuestions.map((q) => q.id),
-      status: "Mengerjakan",
-      deviceId: existingOngoing?.deviceId || "Android-Device",
-      pelanggaranCount: existingOngoing?.pelanggaranCount || 0,
-      pelanggaranLogs: existingOngoing?.pelanggaranLogs || [],
-      jawabanTerisi: resumedFilled,
-      totalSoal: allQuestions.length,
-      raguRagu: resumedRagu,
-      jawabanSiswa: resumedAnswers,
-      lastUpdated: new Date().toISOString()
-    };
-
-    // Push new exam session atomically without colliding with other students
-    flushSessionSync(studentSessi);
-
-    setScreen("exam");
   };
 
   // Stores answer selections locally (instant) and batches remote sync every 15s for 350-student scale
@@ -994,7 +1024,7 @@ export default function StudentSimulator({ standalone = false }: { standalone?: 
     const score = Math.round((correct / questions.length) * 100);
 
     const matchHasil: HasilUjian = {
-      id: `h_${loggedInStudent.nisn}_${selectedJadwal.mapelId}_${Date.now()}`,
+      id: `h_${loggedInStudent.nisn}_${selectedJadwal.mapelId}`,
       siswaNisn: loggedInStudent.nisn,
       siswaNama: loggedInStudent.nama,
       siswaKelas: loggedInStudent.kelas,
@@ -1008,16 +1038,17 @@ export default function StudentSimulator({ standalone = false }: { standalone?: 
       status: "Selesai"
     };
 
-    // Update Hasil database collection (replace prior record for this student + mapel)
-    const allHasil = getDB.hasil().filter(
-      (h) =>
-        !(
+    // Update Hasil atomically for this student + mapel (with automatic retry outbox if network drops)
+    const oldMatchingHasilIds = getDB
+      .hasil()
+      .filter(
+        (h) =>
           (h.siswaNisn === loggedInStudent.nisn ||
             (h.siswaNama || "").toLowerCase() === loggedInStudent.nama.toLowerCase()) &&
           (h.mapelNama || "").toLowerCase() === mapelNama.toLowerCase()
-        )
-    );
-    setDB.hasil([...allHasil, matchHasil]);
+      )
+      .map((h) => h.id);
+    syncSingleHasil(matchHasil, oldMatchingHasilIds);
 
     // Update Student Session atomically to 'Selesai'
     const existingSes = getDB.sessions().find(s => s.id === loggedInStudent.nisn);
@@ -1047,7 +1078,7 @@ export default function StudentSimulator({ standalone = false }: { standalone?: 
           jawabanSiswa: studentAnswers,
           lastUpdated: new Date().toISOString(),
         };
-    flushSessionSync(finishedSession);
+    flushSessionSync(finishedSession, true);
 
     setScreen("completed");
   };
@@ -1119,10 +1150,9 @@ export default function StudentSimulator({ standalone = false }: { standalone?: 
           <div className="w-full max-w-md bg-slate-950 p-8 rounded-3xl border border-slate-800 shadow-2xl space-y-6">
             <div className="text-center space-y-2">
               <img 
-                src="https://i.ibb.co.com/rfswjG1B/MA-AL-MA-SUM.png" 
+                src="/school-logo.png" 
                 alt="MA Al-Ma'sum Logo" 
                 className="w-20 h-20 object-contain mx-auto drop-shadow-md animate-bounce"
-                referrerPolicy="no-referrer"
               />
               <h2 className="text-xl font-extrabold tracking-tight uppercase text-blue-200">GERBANG EXAMBRO CBT AMAN</h2>
               <p className="text-[10px] text-slate-400 font-extrabold tracking-wider uppercase">MA AL-MA'SUM MALAUSMA MAJALENGKA</p>
@@ -1336,10 +1366,9 @@ export default function StudentSimulator({ standalone = false }: { standalone?: 
                   {/* Branding Header inside Phone */}
                   <div className="text-center space-y-1">
                     <img 
-                      src="https://i.ibb.co.com/rfswjG1B/MA-AL-MA-SUM.png" 
+                      src="/school-logo.png" 
                       alt="Madrasah Logo" 
                       className="w-14 h-14 object-contain mx-auto drop-shadow-md animate-bounce" 
-                      referrerPolicy="no-referrer"
                     />
                     <h2 className="font-display font-extrabold text-slate-800 text-[13px] tracking-tight uppercase leading-snug">
                       ExambroAlma
@@ -1822,11 +1851,21 @@ export default function StudentSimulator({ standalone = false }: { standalone?: 
 
                 <button
                   type="button"
+                  disabled={tokenLoading}
                   onClick={handleVerifyToken}
-                  className="w-full p-3 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-xs uppercase rounded-xl transition cursor-pointer flex items-center justify-center gap-1 shadow"
+                  className="w-full p-3 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white font-extrabold text-xs uppercase rounded-xl transition cursor-pointer flex items-center justify-center gap-1 shadow"
                 >
-                  <BookOpen size={13} />
-                  <span>Mulai Mengerjakan</span>
+                  {tokenLoading ? (
+                    <>
+                      <RefreshCw size={13} className="animate-spin" />
+                      <span>Memuat Soal...</span>
+                    </>
+                  ) : (
+                    <>
+                      <BookOpen size={13} />
+                      <span>Mulai Mengerjakan</span>
+                    </>
+                  )}
                 </button>
               </div>
             )}
@@ -1927,7 +1966,7 @@ export default function StudentSimulator({ standalone = false }: { standalone?: 
                       if (!optText && !optImg) return null;
 
                       const isSelected = studentAnswers[currentIndex] === key;
-                      const optArabic = hasArabicText(optText);
+                      const optArabic = isDominantlyArabic(optText);
 
                       return (
                         <button

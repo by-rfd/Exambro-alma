@@ -6,6 +6,7 @@ import {
   getSyncStatus,
   subscribeToSyncStatus,
   clearSyncError,
+  syncSingleSession,
   SyncStatus,
 } from "../firebaseConfig";
 import {
@@ -219,17 +220,15 @@ export default function PengawasPortal({ onLogout, pengawasUser }: PengawasPorta
   };
 
   const handleClearSiswaViolations = (id: string) => {
-    const current = [...getDB.sessions()];
-    const idx = current.findIndex((s) => s.id === id);
-    if (idx !== -1) {
-      current[idx] = {
-        ...current[idx],
+    const existing = getDB.sessions().find((s) => s.id === id);
+    if (existing) {
+      syncSingleSession({
+        ...existing,
         pelanggaranCount: 0,
         pelanggaranLogs: [],
         status: "Mengerjakan",
         lastUpdated: new Date().toISOString(),
-      };
-      setDB.sessions(current);
+      });
     }
   };
 

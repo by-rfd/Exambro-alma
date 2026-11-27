@@ -65,6 +65,8 @@ export interface Soal {
   kunci: "A" | "B" | "C" | "D" | "E";
   guruId?: string; // If added by a specific teacher
   kelasIds?: string[]; // Target academic class IDs (e.g., X-1, X-2, X-3)
+  createdAt?: number; // Upload/creation timestamp in ms
+  urutan?: number; // Original 0-based order index within upload batch
 }
 
 export interface JadwalUjian {
